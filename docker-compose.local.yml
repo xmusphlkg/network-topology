@@ -1,0 +1,45 @@
+services:
+  switch-topology-db:
+    image: mysql:8.0
+    container_name: switch-topology-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-topology_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-switch_topology}
+      MYSQL_USER: ${MYSQL_USER:-switch_topology}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-switch_topology}
+      TZ: ${MYSQL_TZ:-Asia/Shanghai}
+    command:
+      - mysqld
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max_connections=500
+    volumes:
+      - switch-topology-mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -u"$${MYSQL_USER}" -p"$${MYSQL_PASSWORD}" >/dev/null || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+
+  switch-topology:
+    network_mode: bridge
+    depends_on:
+      switch-topology-db:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: switch-topology-db
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-switch_topology}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-switch_topology}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-switch_topology}
+    ports:
+      - "8091:8091"
+
+volumes:
+  switch-topology-mysql-data:

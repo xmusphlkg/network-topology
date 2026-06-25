@@ -1,0 +1,22 @@
+name: switch-topology
+
+services:
+  switch-topology:
+    image: ${APP_IMAGE:-switch-topology-switch-topology:latest}
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        VITE_BASE_PATH: ${VITE_BASE_PATH:-/network/}
+        VITE_API_BASE: ${VITE_API_BASE:-/network}
+    env_file:
+      - .env
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=2).read()\""]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -1,0 +1,12 @@
+.env
+api/.venv/
+api/.pytest_cache/
+api/**/__pycache__/
+api/**/*.pyc
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+.git/
+
