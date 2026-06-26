@@ -1,17 +1,18 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Plus, Save, Search, Trash2 } from 'lucide-react';
+import { ArrowLeft, PencilLine, Plus, Save, Search, Trash2, X } from 'lucide-react';
 import { api } from '../lib/api';
 import { queryKeys } from '../lib/queryKeys';
 import { CopyLinkButton } from '../components/CopyLinkButton';
 import { bps, dateTime, speed } from '../lib/format';
-import type { Port } from '../types';
+import type { DeviceProfile, Port } from '../types';
 import { EChart } from '../components/EChart';
 import { MetricStrip } from '../components/MetricStrip';
 import { PortMatrix } from '../components/PortMatrix';
 import { StatusPill } from '../components/StatusPill';
 import { useFeedback } from '../components/FeedbackCenter';
+import { useI18n } from '../i18n/I18nProvider';
 
 export function DeviceDetailPage() {
   const queryClient = useQueryClient();
@@ -19,8 +20,15 @@ export function DeviceDetailPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const id = Number(useParams().id);
   const feedback = useFeedback();
+  const { t } = useI18n();
   const devices = useQuery({ queryKey: queryKeys.devices(), queryFn: () => api.devices({ includeDisabled: true }) });
-  const ports = useQuery({ queryKey: ['device-ports', id], queryFn: () => api.devicePorts(id), enabled: Boolean(id) });
+  const [includeVirtualPorts, setIncludeVirtualPorts] = useState(false);
+  const ports = useQuery({
+    queryKey: queryKeys.devicePorts(id, { includeVirtual: includeVirtualPorts }),
+    queryFn: () => api.devicePorts(id, { includeVirtual: includeVirtualPorts }),
+    enabled: Boolean(id),
+  });
+  const deviceProfiles = useQuery({ queryKey: queryKeys.deviceProfiles(), queryFn: api.deviceProfiles, staleTime: 30_000 });
   const device = devices.data?.find((item) => item.id === id);
   const selectedPortIdQuery = searchParams.get('portId') || '';
   const selectedPort = useMemo(() => {
@@ -35,6 +43,7 @@ export function DeviceDetailPage() {
   const [newPortAlias, setNewPortAlias] = useState('');
   const [newPortSpeed, setNewPortSpeed] = useState('');
   const [newPortMedia, setNewPortMedia] = useState('');
+  const [newPortMac, setNewPortMac] = useState('');
   const [newPortRole, setNewPortRole] = useState('');
   const [newPortVlan, setNewPortVlan] = useState('');
   const [editName, setEditName] = useState('');
@@ -43,12 +52,17 @@ export function DeviceDetailPage() {
   const [editAdminStatus, setEditAdminStatus] = useState('unknown');
   const [editSpeed, setEditSpeed] = useState('');
   const [editMedia, setEditMedia] = useState('');
+  const [editMac, setEditMac] = useState('');
   const [editRole, setEditRole] = useState('');
   const [editVlan, setEditVlan] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [editingDisplayName, setEditingDisplayName] = useState(false);
+  const [selectedProfile, setSelectedProfile] = useState('');
+  const [replaceProfilePorts, setReplaceProfilePorts] = useState(false);
   const [portSearch, setPortSearch] = useState('');
   const [trafficRange, setTrafficRange] = useState<'1h' | '6h' | '24h' | '7d'>('24h');
   const series = useQuery({
-    queryKey: ['port-series', selectedPort?.id || 'none', trafficRange],
+    queryKey: queryKeys.portSeries(selectedPort?.id || 'none', trafficRange),
     queryFn: () => api.portSeries(selectedPort!.id, trafficRange),
     enabled: Boolean(selectedPort?.id),
   });
@@ -80,15 +94,28 @@ export function DeviceDetailPage() {
     setEditAdminStatus(selectedPort.adminStatus || 'unknown');
     setEditSpeed(selectedPort.speedMbps == null ? '' : String(selectedPort.speedMbps));
     setEditMedia(selectedPort.media || '');
+    setEditMac(selectedPort.macAddress || '');
     setEditRole(selectedPort.portRole || '');
     setEditVlan(selectedPort.vlanSummary || '');
   }, [selectedPort?.id, selectedPort?.updatedAt]);
+
+  useEffect(() => {
+    if (!device) return;
+    setDisplayName(device.displayName);
+  }, [device?.displayName]);
+
+  useEffect(() => {
+    const model = device?.model || '';
+    if (!deviceProfiles.data?.length) return;
+    const match = deviceProfiles.data.find((profile) => profile.models.some((item) => item.toLowerCase() === model.toLowerCase()));
+    setSelectedProfile(match?.key || deviceProfiles.data[0]?.key || '');
+  }, [device?.model, deviceProfiles.data]);
 
   const filteredPorts = useMemo(() => {
     const query = portSearch.trim().toLowerCase();
     return (ports.data || []).filter((port) => {
       if (!query) return true;
-      return [port.name, port.alias, port.vlanSummary, port.media, port.operStatus]
+      return [port.name, port.alias, port.vlanSummary, port.media, port.macAddress, port.operStatus]
         .filter(Boolean)
         .join(' ')
         .toLowerCase()
@@ -130,6 +157,7 @@ export function DeviceDetailPage() {
         alias: emptyToNull(newPortAlias),
         speedMbps: numberOrNull(newPortSpeed),
         media: emptyToNull(newPortMedia),
+        macAddress: emptyToNull(newPortMac),
         portRole: emptyToNull(newPortRole),
         vlanSummary: emptyToNull(newPortVlan),
       }),
@@ -139,6 +167,7 @@ export function DeviceDetailPage() {
       setNewPortAlias('');
       setNewPortSpeed('');
       setNewPortMedia('');
+      setNewPortMac('');
       setNewPortRole('');
       setNewPortVlan('');
       invalidateDeviceData(queryClient, id);
@@ -158,6 +187,7 @@ export function DeviceDetailPage() {
         adminStatus: editAdminStatus,
         speedMbps: numberOrNull(editSpeed),
         media: emptyToNull(editMedia),
+        macAddress: emptyToNull(editMac),
         portRole: emptyToNull(editRole),
         vlanSummary: emptyToNull(editVlan),
       }),
@@ -198,6 +228,33 @@ export function DeviceDetailPage() {
     },
   });
 
+  const updateDisplayName = useMutation({
+    mutationFn: () => api.updateDevice(id, { displayName }),
+    onSuccess: () => {
+      invalidateDeviceData(queryClient, id);
+      setEditingDisplayName(false);
+      feedback.pushToast(t('rename') + '成功', 'success');
+    },
+    onError: (error: Error) => {
+      feedback.pushToast(error.message, 'error');
+    },
+  });
+
+  const applyProfile = useMutation({
+    mutationFn: () =>
+      api.applyDeviceProfile(id, {
+        profileKey: selectedProfile,
+        replaceProfilePorts,
+      }),
+    onSuccess: () => {
+      invalidateDeviceData(queryClient, id);
+      feedback.pushToast(t('applyTemplate') + '成功', 'success');
+    },
+    onError: (error: Error) => {
+      feedback.pushToast(error.message, 'error');
+    },
+  });
+
   function submitNewPort(event: FormEvent) {
     event.preventDefault();
     if (!newPortName.trim()) return;
@@ -208,6 +265,23 @@ export function DeviceDetailPage() {
     event.preventDefault();
     if (!selectedPort || !editName.trim()) return;
     updatePort.mutate();
+  }
+
+  function submitDisplayName(event: FormEvent) {
+    event.preventDefault();
+    if (!displayName.trim()) return;
+    updateDisplayName.mutate();
+  }
+
+  function cancelDisplayNameEdit() {
+    setEditingDisplayName(false);
+    setDisplayName(device?.displayName || '');
+  }
+
+  function submitProfile(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedProfile) return;
+    applyProfile.mutate();
   }
 
   function confirmDeleteSelectedPort() {
@@ -255,14 +329,36 @@ export function DeviceDetailPage() {
       <div className="page-head">
         <div>
           <Link className="back-link" to="/topology"><ArrowLeft size={16} />返回</Link>
-          <h1>{device.displayName}</h1>
+          {editingDisplayName ? (
+            <form className="inline-form inline-form--compact device-name-form" onSubmit={submitDisplayName}>
+              <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
+              <button className="icon-button" type="submit" title={t('save')} disabled={updateDisplayName.isPending}>
+                <Save size={16} />
+              </button>
+              <button className="icon-button" type="button" onClick={cancelDisplayNameEdit} title={t('cancel')}>
+                <X size={16} />
+              </button>
+            </form>
+          ) : (
+            <div className="device-title">
+              <h1>{device.displayName}</h1>
+              <button
+                className="icon-button"
+                type="button"
+                title={t('rename')}
+                onClick={() => setEditingDisplayName(true)}
+              >
+                <PencilLine size={16} />
+              </button>
+            </div>
+          )}
           <p>{device.model || '-'} · {device.mgmtIp || '-'}</p>
         </div>
         <div className="toolbar">
           <CopyLinkButton />
           <StatusPill value={device.health} />
-          <button className="danger-button" type="button" onClick={confirmDeleteDevice} disabled={deleteDevice.isPending}>
-            <Trash2 size={16} />删除设备
+          <button className="icon-button danger-button" type="button" onClick={confirmDeleteDevice} disabled={deleteDevice.isPending} title={t('delete')}>
+            <Trash2 size={16} />
           </button>
         </div>
       </div>
@@ -285,6 +381,38 @@ export function DeviceDetailPage() {
           { label: '手工端口', value: manualPorts },
         ]}
       />
+
+      <section className="panel">
+        <div className="section-head">
+          <h2>{t('deviceProfiles')}</h2>
+          <button
+            className="text-button"
+            onClick={submitProfile}
+            type="submit"
+            form="device-profile-form"
+            disabled={!selectedProfile || applyProfile.isPending}
+          >
+            <Save size={14} />{t('applyTemplate')}
+          </button>
+        </div>
+        <form id="device-profile-form" className="device-profile-form" onSubmit={submitProfile}>
+          <label className="device-profile-select">
+            <span>模板</span>
+            <select value={selectedProfile} onChange={(event) => setSelectedProfile(event.target.value)}>
+              <option value="">选择模板</option>
+              {deviceProfiles.data?.map((profile) => (
+                <option key={profile.key} value={profile.key}>
+                  {profile.key}（{profile.portCount} 端口）
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="compact-checkbox">
+            <input type="checkbox" checked={replaceProfilePorts} onChange={(event) => setReplaceProfilePorts(event.target.checked)} />
+            <span>{t('replaceTemplatePorts')}</span>
+          </label>
+        </form>
+      </section>
 
       <section className="port-workbench">
         <form className="panel port-edit-panel" onSubmit={submitNewPort}>
@@ -315,6 +443,10 @@ export function DeviceDetailPage() {
                 <option value="fiber">光口</option>
                 <option value="virtual">虚拟</option>
               </select>
+            </label>
+            <label>
+              <span>MAC</span>
+              <input value={newPortMac} onChange={(event) => setNewPortMac(event.target.value)} placeholder="52:54:00:aa:bb:cc" />
             </label>
             <label>
               <span>角色</span>
@@ -386,6 +518,10 @@ export function DeviceDetailPage() {
                 </select>
               </label>
               <label>
+                <span>MAC</span>
+                <input value={editMac} onChange={(event) => setEditMac(event.target.value)} placeholder="52:54:00:aa:bb:cc" />
+              </label>
+              <label>
                 <span>角色</span>
                 <select value={editRole} onChange={(event) => setEditRole(event.target.value)}>
                   <option value="">未指定</option>
@@ -415,7 +551,16 @@ export function DeviceDetailPage() {
             <span><i className="dot down" />未连接</span>
           </div>
         </div>
-        <PortMatrix ports={ports.data || []} selectedPortId={selectedPort?.id} onSelect={selectPort} />
+        <PortMatrix
+          ports={ports.data || []}
+          selectedPortId={selectedPort?.id}
+          onSelect={selectPort}
+          compact={false}
+          columns={null}
+          rows={device.role === 'switch' ? 2 : 1}
+          arrangement={device.role === 'switch' ? 'odd-even' : 'server'}
+          hideVirtual={!includeVirtualPorts}
+        />
       </section>
 
       <section className="panel">
@@ -423,7 +568,11 @@ export function DeviceDetailPage() {
           <h2>端口列表</h2>
           <label className="workbench-search compact">
             <Search size={15} />
-            <input value={portSearch} onChange={(event) => setPortSearch(event.target.value)} placeholder="搜索端口、别名、VLAN" />
+            <input value={portSearch} onChange={(event) => setPortSearch(event.target.value)} placeholder="搜索端口、别名、VLAN、MAC" />
+          </label>
+          <label className="compact-checkbox">
+            <input type="checkbox" checked={includeVirtualPorts} onChange={(event) => setIncludeVirtualPorts(event.target.checked)} />
+            <span>包含虚拟口</span>
           </label>
         </div>
         <div className="table-wrap">
@@ -434,6 +583,7 @@ export function DeviceDetailPage() {
                 <th>状态</th>
                 <th>协商速率</th>
                 <th>介质</th>
+                <th>MAC</th>
                 <th>VLAN</th>
                 <th>5min 上/下行</th>
                 <th>别名</th>
@@ -447,6 +597,7 @@ export function DeviceDetailPage() {
                   <td><StatusPill value={port.operStatus} /></td>
                   <td>{speed(port.speedMbps)}</td>
                   <td>{port.media || '-'}</td>
+                  <td>{port.macAddress || '-'}</td>
                   <td>{port.vlanSummary || '-'}</td>
                   <td>{bps(port.lastTrafficInBps)} / {bps(port.lastTrafficOutBps)}</td>
                   <td>{port.alias || '-'}</td>
@@ -538,8 +689,8 @@ function numberOrNull(value: string) {
 }
 
 function invalidateDeviceData(queryClient: ReturnType<typeof useQueryClient>, deviceId: number) {
-  queryClient.invalidateQueries({ queryKey: queryKeys.devices() });
+  queryClient.invalidateQueries({ queryKey: queryKeys.devicesAll() });
   queryClient.invalidateQueries({ queryKey: queryKeys.devicePorts(deviceId) });
-  queryClient.invalidateQueries({ queryKey: queryKeys.ports() });
-  queryClient.invalidateQueries({ queryKey: queryKeys.topology() });
+  queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
+  queryClient.invalidateQueries({ queryKey: queryKeys.topologyAll() });
 }

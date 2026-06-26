@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.config import Settings
-from app.services.mapper import map_zabbix_inventory, normalize_speed_mbps
+from app.services.mapper import is_virtual_port_name, map_zabbix_inventory, normalize_speed_mbps
 
 
 def test_ruijie_s6220_ports_are_discovered_from_zabbix_items():
@@ -208,6 +208,14 @@ def test_virtual_interfaces_are_not_imported_as_physical_ports():
     snapshots = map_zabbix_inventory(hosts, items, settings)
 
     assert {port.name for port in snapshots[0].ports} == {"eth0"}
+
+
+def test_ikuai_vwan_variants_are_virtual_interfaces():
+    assert is_virtual_port_name("vWAN2001")
+    assert is_virtual_port_name("Interface vWAN2001")
+    assert is_virtual_port_name("vwan2001-wan")
+    assert not is_virtual_port_name("wan1")
+    assert not is_virtual_port_name("lan2")
 
 
 def test_generic_vendor_interface_names_are_supported():

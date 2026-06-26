@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .services.mac import normalize_mac_address
+
 
 class PortRead(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -20,6 +22,7 @@ class PortRead(BaseModel):
     adminStatus: str = Field(validation_alias="admin_status")
     speedMbps: float | None = Field(default=None, validation_alias="speed_mbps")
     media: str | None = None
+    macAddress: str | None = Field(default=None, validation_alias="mac_address")
     portRole: str | None = Field(default=None, validation_alias="port_role")
     vlanSummary: str | None = Field(default=None, validation_alias="vlan_summary")
     poeStatus: str | None = Field(default=None, validation_alias="poe_status")
@@ -38,9 +41,15 @@ class PortCreate(BaseModel):
     ifIndex: int | None = None
     speedMbps: float | None = None
     media: str | None = None
+    macAddress: str | None = None
     portRole: str | None = None
     vlanSummary: str | None = None
     poeStatus: str | None = None
+
+    @field_validator("macAddress")
+    @classmethod
+    def normalize_mac(cls, value: str | None) -> str | None:
+        return normalize_mac_address(value)
 
 
 class PortUpdate(BaseModel):
@@ -50,10 +59,16 @@ class PortUpdate(BaseModel):
     adminStatus: str | None = None
     speedMbps: float | None = None
     media: str | None = None
+    macAddress: str | None = None
     portRole: str | None = None
     vlanSummary: str | None = None
     poeStatus: str | None = None
     stale: bool | None = None
+
+    @field_validator("macAddress")
+    @classmethod
+    def normalize_mac(cls, value: str | None) -> str | None:
+        return normalize_mac_address(value)
 
 
 class DeviceRead(BaseModel):
@@ -107,6 +122,7 @@ class CableLinkRead(BaseModel):
     endpointBPortId: int = Field(validation_alias="endpoint_b_port_id")
     label: str | None = None
     cableNo: str | None = Field(default=None, validation_alias="cable_no")
+    vlanId: int | None = Field(default=None, validation_alias="vlan_id", ge=1, le=4094)
     color: str | None = None
     notes: str | None = None
     verifiedAt: datetime | None = Field(default=None, validation_alias="verified_at")
@@ -120,6 +136,7 @@ class CableLinkCreate(BaseModel):
     endpointBPortId: int
     label: str | None = None
     cableNo: str | None = None
+    vlanId: int | None = Field(default=None, ge=1, le=4094)
     color: str | None = "#4f8cff"
     notes: str | None = None
     verifiedAt: datetime | None = None
@@ -136,6 +153,7 @@ class CableLinkCreate(BaseModel):
 class CableLinkUpdate(BaseModel):
     label: str | None = None
     cableNo: str | None = None
+    vlanId: int | None = Field(default=None, ge=1, le=4094)
     color: str | None = None
     notes: str | None = None
     verifiedAt: datetime | None = None
@@ -211,6 +229,101 @@ class TopologyDeviceIds(BaseModel):
 
 class TopologyImportRequest(BaseModel):
     hostids: list[str] = Field(default_factory=list)
+
+
+class DeviceProfileApplyRequest(BaseModel):
+    profileKey: str
+    replaceProfilePorts: bool = False
+
+
+class IngestPort(BaseModel):
+    name: str
+    ifIndex: int | None = None
+    alias: str | None = None
+    operStatus: str | None = None
+    adminStatus: str | None = None
+    speedMbps: float | None = None
+    media: str | None = None
+    macAddress: str | None = None
+    portRole: str | None = None
+    vlanSummary: str | None = None
+    poeStatus: str | None = None
+    lastTrafficInBps: float | None = None
+    lastTrafficOutBps: float | None = None
+    rxErrors: float | None = None
+    txErrors: float | None = None
+
+    @field_validator("macAddress")
+    @classmethod
+    def normalize_mac(cls, value: str | None) -> str | None:
+        return normalize_mac_address(value)
+
+
+class IngestDevice(BaseModel):
+    displayName: str
+    role: Literal["switch", "server", "custom"] = "server"
+    mgmtIp: str | None = None
+    zabbixHostid: str | None = None
+    model: str | None = None
+    status: str | None = None
+    health: str | None = None
+    lastSeenAt: str | None = None
+    source: str = "agent"
+    enabled: bool = True
+    ports: list[IngestPort] = Field(default_factory=list)
+    strictPhysicalPorts: bool = False
+
+
+class IngestEndpointRef(BaseModel):
+    deviceId: int | None = None
+    zabbixHostid: str | None = None
+    mgmtIp: str | None = None
+    displayName: str | None = None
+    portName: str | None = None
+    ifIndex: int | None = None
+    macAddress: str | None = None
+
+    @field_validator("macAddress")
+    @classmethod
+    def normalize_mac(cls, value: str | None) -> str | None:
+        return normalize_mac_address(value)
+
+
+class IngestCable(BaseModel):
+    endpointA: IngestEndpointRef
+    endpointB: IngestEndpointRef
+    cableNo: str | None = None
+    label: str | None = None
+    vlanId: int | None = Field(default=None, ge=1, le=4094)
+    notes: str | None = None
+    color: str | None = None
+    verifiedAt: str | None = None
+
+
+class IngestRequest(BaseModel):
+    source: str = "agent"
+    topologyId: int | None = None
+    strictPhysicalPorts: bool = False
+    physicalPortNamePatterns: list[str] = Field(default_factory=list)
+    maxPhysicalPortsPerDevice: int | None = Field(default=None, ge=1)
+    devices: list[IngestDevice] = Field(default_factory=list)
+    cables: list[IngestCable] = Field(default_factory=list)
+
+
+class IngestResult(BaseModel):
+    devices: int
+    ports: int
+    cables: int
+
+
+class IpAddrIngestRequest(BaseModel):
+    displayName: str
+    output: str
+    topologyId: int | None = None
+    mgmtIp: str | None = None
+    source: str = "command"
+    strictPhysicalPorts: bool = True
+    physicalPortNamePatterns: list[str] = Field(default_factory=lambda: ["eth", "eno", "ens", "enp", "enx", "em", "ib", "bond", "wan", "lan", "idrac", "ipmi", "bmc", "ilo"])
 
 
 class ZabbixDiscoveredDevice(BaseModel):

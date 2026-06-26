@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..clients.zabbix import ZabbixClient
 from ..config import Settings
 from ..db_models import Device, Port, ZabbixSyncRun
+from .manual_overrides import set_optional_unless_overridden, set_unless_overridden
 from .mapper import DeviceSnapshot, PortSnapshot, map_zabbix_inventory, normalize_port_name
 from .profiles import profile_for_model
 
@@ -98,10 +99,10 @@ async def upsert_device(session: AsyncSession, snapshot: DeviceSnapshot) -> Devi
         session.add(device)
         await session.flush()
     device.source = "zabbix"
-    device.role = snapshot.role
-    device.display_name = snapshot.display_name
-    device.model = snapshot.model
-    device.mgmt_ip = snapshot.mgmt_ip
+    set_unless_overridden(device, "role", snapshot.role)
+    set_unless_overridden(device, "display_name", snapshot.display_name)
+    set_unless_overridden(device, "model", snapshot.model)
+    set_unless_overridden(device, "mgmt_ip", snapshot.mgmt_ip)
     device.status = snapshot.status
     device.health = snapshot.health
     device.last_seen_at = snapshot.last_seen_at
@@ -121,15 +122,16 @@ async def upsert_port(session: AsyncSession, device: Device, snapshot: PortSnaps
     port.source = "zabbix"
     port.identity = snapshot.identity
     port.if_index = snapshot.if_index
-    port.name = snapshot.name
-    port.alias = snapshot.alias
+    set_unless_overridden(port, "name", snapshot.name)
+    set_unless_overridden(port, "alias", snapshot.alias)
     port.oper_status = snapshot.oper_status
     port.admin_status = snapshot.admin_status
-    port.speed_mbps = snapshot.speed_mbps
-    port.media = snapshot.media
-    port.port_role = snapshot.port_role
-    port.vlan_summary = snapshot.vlan_summary
-    port.poe_status = snapshot.poe_status
+    set_unless_overridden(port, "speed_mbps", snapshot.speed_mbps)
+    set_unless_overridden(port, "media", snapshot.media)
+    set_optional_unless_overridden(port, "mac_address", snapshot.mac_address)
+    set_optional_unless_overridden(port, "port_role", snapshot.port_role)
+    set_unless_overridden(port, "vlan_summary", snapshot.vlan_summary)
+    set_unless_overridden(port, "poe_status", snapshot.poe_status)
     port.last_traffic_in_bps = snapshot.last_traffic_in_bps
     port.last_traffic_out_bps = snapshot.last_traffic_out_bps
     port.rx_errors = snapshot.rx_errors

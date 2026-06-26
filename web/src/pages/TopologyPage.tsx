@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   Controls,
@@ -12,56 +12,46 @@ import {
 } from '@xyflow/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
-import { Activity, Box, Cable, Check, ChevronDown, ChevronRight, Download, Link, Network, Plus, RefreshCw, Save, Search, Server, Upload } from 'lucide-react';
+import {
+  Activity,
+  Box,
+  Cable,
+  Network,
+  PencilLine,
+  Plus,
+  RefreshCw,
+  Search,
+  Server,
+  Trash2,
+} from 'lucide-react';
 import { api } from '../lib/api';
 import { queryKeys } from '../lib/queryKeys';
-import type { CableLink, Device, Port, ZabbixDiscoveredDevice } from '../types';
+import type { CableLink, Device, Port } from '../types';
 import { SwitchNode, EndpointNode } from '../components/TopologyNodes';
-import { StatusPill } from '../components/StatusPill';
 import { useFeedback } from '../components/FeedbackCenter';
+import { DeviceCompactCard } from '../components/DeviceCompactCard';
+import { RailSection } from '../components/RailSection';
+import { getSwitchPortLayout, switchPortLayoutTemplates } from '../lib/switchPortLayouts';
+import {
+  loadRailWorkspaceState,
+  loadSwitchPortLayout,
+  loadDevicePortLayouts,
+  saveDevicePortLayouts,
+  saveRailWorkspaceState,
+  saveSwitchPortLayout,
+  type RailToolKey,
+  type RailWorkspaceState,
+} from './topology/workspaceState';
+import { TopologyToolbar } from './topology/TopologyToolbar';
+import { CableInspector } from './topology/CableInspector';
+import { TopologyMembersPanel } from './topology/TopologyMembersPanel';
+import { TopologyDiscoveryPanel } from './topology/TopologyDiscoveryPanel';
+import { DeviceEditDialog } from './topology/DeviceEditDialog';
+import { parseDeviceYaml } from '../lib/deviceConfigYaml';
 
 const nodeTypes = { switchNode: SwitchNode, endpointNode: EndpointNode };
 type DeviceRoleFilter = 'all' | 'switch' | 'server' | 'custom';
-type RailToolKey = 'members' | 'discovery' | 'inspector';
 type PendingLink = { a: Port; b?: Port };
-interface RailWorkspaceState {
-  overviewOpen: boolean;
-  activeTool: RailToolKey;
-}
-
-const railWorkspaceStorageKey = 'switch-topology:topology-rail-workspace';
-
-function isRailToolKey(value: unknown): value is RailToolKey {
-  return value === 'members' || value === 'discovery' || value === 'inspector';
-}
-
-function loadRailWorkspaceState(): RailWorkspaceState {
-  const fallback: RailWorkspaceState = {
-    overviewOpen: true,
-    activeTool: 'members',
-  };
-  if (typeof window === 'undefined') return fallback;
-  try {
-    const raw = window.localStorage.getItem(railWorkspaceStorageKey);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<RailWorkspaceState> & Partial<Record<'overview' | 'members' | 'discovery' | 'inspector', boolean>>;
-    return {
-      overviewOpen: typeof parsed.overviewOpen === 'boolean' ? parsed.overviewOpen : typeof parsed.overview === 'boolean' ? parsed.overview : fallback.overviewOpen,
-      activeTool:
-        isRailToolKey(parsed.activeTool)
-          ? parsed.activeTool
-          : parsed.members
-            ? 'members'
-            : parsed.discovery
-              ? 'discovery'
-              : parsed.inspector
-                ? 'inspector'
-                : fallback.activeTool,
-    };
-  } catch {
-    return fallback;
-  }
-}
 
 export function TopologyPage() {
   const queryClient = useQueryClient();
@@ -77,12 +67,13 @@ export function TopologyPage() {
   const [editingCable, setEditingCable] = useState<CableLink | null>(null);
   const [cableNo, setCableNo] = useState('');
   const [label, setLabel] = useState('');
+  const [vlanId, setVlanId] = useState('');
   const [notes, setNotes] = useState('');
+  const [highlightedCableId, setHighlightedCableId] = useState<number | null>(null);
   const [newTopologyName, setNewTopologyName] = useState('');
   const [newTopologyDefault, setNewTopologyDefault] = useState(false);
   const [movedNodes, setMovedNodes] = useState<Record<string, { x: number; y: number }>>({});
-  const [layoutDirty, setLayoutDirty] = useState(false);
-  const [lastSavedLayout, setLastSavedLayout] = useState<number | null>(null);
+  const [hasLayoutDirty, setHasLayoutDirty] = useState(false);
   const [discoveredSelection, setDiscoveredSelection] = useState<Set<string>>(new Set());
   const [topologyDeviceSelection, setTopologyDeviceSelection] = useState<Set<number>>(new Set());
   const [deviceRoleFilter, setDeviceRoleFilter] = useState<DeviceRoleFilter>('all');
@@ -92,14 +83,29 @@ export function TopologyPage() {
   const [railWorkspace, setRailWorkspace] = useState<RailWorkspaceState>(() => loadRailWorkspaceState());
   const [layoutKey, setLayoutKey] = useState('default');
   const [hasRestoredViewport, setHasRestoredViewport] = useState(false);
+  const [switchPortLayoutKey, setSwitchPortLayoutKey] = useState(() => loadSwitchPortLayout());
+  const [devicePortLayouts, setDevicePortLayouts] = useState<Record<number, string>>({});
+  const [editingDevice, setEditingDevice] = useState<Device | null>(null);
+  const [savingDeviceConfig, setSavingDeviceConfig] = useState(false);
   const topologyIdParam = searchParams.get('topologyId') || '';
   const activeRailTool = railWorkspace.activeTool;
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(null);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    window.localStorage.setItem(railWorkspaceStorageKey, JSON.stringify(railWorkspace));
+    saveRailWorkspaceState(railWorkspace);
   }, [railWorkspace]);
+
+  useEffect(() => {
+    saveSwitchPortLayout(switchPortLayoutKey);
+  }, [switchPortLayoutKey]);
+
+  useEffect(() => {
+    setDevicePortLayouts(loadDevicePortLayouts(topologyId));
+  }, [topologyId]);
+
+  useEffect(() => {
+    saveDevicePortLayouts(topologyId, devicePortLayouts);
+  }, [devicePortLayouts, topologyId]);
 
   useEffect(() => {
     if (!topologies.data?.length) return;
@@ -128,16 +134,17 @@ export function TopologyPage() {
   useEffect(() => {
     setLayoutKey(topologyId ? `topology:${topologyId}` : 'default');
     setMovedNodes({});
-    setLayoutDirty(false);
-    setLastSavedLayout(null);
+    setHasLayoutDirty(false);
     setSelectedPort(null);
     setEditingCable(null);
     setPendingLink(null);
+    setConnectMode(false);
     setHasRestoredViewport(false);
     setDiscoveredSelection(new Set());
     setTopologyDeviceSelection(new Set());
     setDeviceRoleFilter('all');
     setHighlightedDeviceId(null);
+    setEditingDevice(null);
     setDeviceSearch('');
   }, [topologyId]);
 
@@ -177,16 +184,20 @@ export function TopologyPage() {
 
   const createCable = useMutation({
     mutationFn: api.createCable,
-    onSuccess: () => {
-      setSelectedPort(null);
+    onSuccess: (created) => {
       setPendingLink(null);
-      setCableNo('');
-      setLabel('');
-      setNotes('');
-      setLastSavedLayout(null);
+      setSelectedPort(null);
+      setEditingCable(created);
+      setCableNo(created.cableNo || '');
+      setLabel(created.label || '');
+      setVlanId(created.vlanId ? String(created.vlanId) : '');
+      setNotes(created.notes || '');
+      setHighlightedCableId(created.id);
+      setConnectMode(false);
+      setActiveRailTool('inspector');
       queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
-      queryClient.invalidateQueries({ queryKey: queryKeys.ports() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
       feedback.pushToast('线缆已添加', 'success');
     },
     onError: (error: Error) => {
@@ -243,7 +254,7 @@ export function TopologyPage() {
     mutationFn: (deviceIds: number[]) => api.assignDevicesToTopology(topologyId || 0, { deviceIds }),
     onSuccess: () => {
       setTopologyDeviceSelection(new Set());
-      queryClient.invalidateQueries({ queryKey: queryKeys.devices() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.devicesAll() });
       queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
       feedback.pushToast('设备已加入拓扑', 'success');
@@ -256,7 +267,7 @@ export function TopologyPage() {
   const importTopologyJson = useMutation({
     mutationFn: (payload: Record<string, unknown>) => api.importTopologyJson(topologyId || 0, payload),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.devices() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.devicesAll() });
       queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
       feedback.pushToast('拓扑 JSON 已导入', 'success');
@@ -272,8 +283,7 @@ export function TopologyPage() {
       viewport?: { x: number; y: number; zoom: number };
     }) => api.saveLayout(payload.nodes, layoutKey, payload.viewport),
     onSuccess: () => {
-      setLayoutDirty(false);
-      setLastSavedLayout(Date.now());
+      setHasLayoutDirty(false);
       feedback.pushToast('布局已保存', 'success');
     },
     onError: (error: Error) => {
@@ -282,15 +292,19 @@ export function TopologyPage() {
   });
 
   const updateCable = useMutation({
-    mutationFn: (payload: { id: number; cableNo?: string | null; label?: string | null; notes?: string | null }) =>
+    mutationFn: (payload: { id: number; cableNo?: string | null; label?: string | null; vlanId?: number | null; notes?: string | null }) =>
       api.updateCable(payload.id, {
         cableNo: payload.cableNo,
         label: payload.label,
+        vlanId: payload.vlanId,
         notes: payload.notes,
       }),
-    onSuccess: () => {
-      setEditingCable(null);
+    onSuccess: (updated) => {
+      clearCableForm();
+      setHighlightedCableId(updated.id);
+      setConnectMode(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
       feedback.pushToast('线缆信息已保存', 'success');
     },
     onError: (error: Error) => {
@@ -301,10 +315,10 @@ export function TopologyPage() {
   const deleteCable = useMutation({
     mutationFn: (linkId: number) => api.deleteCable(linkId),
     onSuccess: () => {
-      setEditingCable(null);
-      setPendingLink(null);
+      clearCableForm();
+      setConnectMode(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.ports() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
       feedback.pushToast('线缆已删除', 'success');
     },
     onError: (error: Error) => {
@@ -312,52 +326,123 @@ export function TopologyPage() {
     },
   });
 
-  const candidatePortId = connectMode ? selectedPort?.id || null : null;
+  const deleteDevice = useMutation({
+    mutationFn: api.deleteDevice,
+    onSuccess: () => {
+      setHighlightedDeviceId(null);
+      setSelectedPort(null);
+      setPendingLink(null);
+      queryClient.invalidateQueries({ queryKey: queryKeys.devicesAll() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
+      feedback.pushToast('设备已删除', 'success');
+    },
+    onError: (error: Error) => {
+      feedback.pushToast(error.message, 'error');
+    },
+  });
+
+  const importIpAddr = useMutation({
+    mutationFn: (payload: { device: Device; output: string; mgmtIp?: string | null; topologyId?: number | null }) =>
+      api.syncIpAddr({
+        displayName: payload.device.displayName,
+        mgmtIp: payload.mgmtIp ?? payload.device.mgmtIp ?? null,
+        topologyId: payload.topologyId ?? topologyId,
+        output: payload.output,
+        source: 'command',
+        strictPhysicalPorts: true,
+        physicalPortNamePatterns: ['eth', 'eno', 'ens', 'enp', 'enx', 'em', 'ib', 'bond', 'wan', 'lan', 'idrac', 'ipmi', 'bmc', 'ilo'],
+      }),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.devicesAll() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
+      feedback.pushToast(`已导入 ${result.ports} 个端口`, 'success');
+    },
+    onError: (error: Error) => {
+      feedback.pushToast(error.message, 'error', 5000);
+    },
+  });
+
+  const linkedPortIds = useMemo(() => {
+    const ids = new Set<number>();
+    for (const cable of topologyQuery.data?.cableLinks || []) {
+      ids.add(cable.endpointAPortId);
+      ids.add(cable.endpointBPortId);
+    }
+    return [...ids].sort((left, right) => left - right);
+  }, [topologyQuery.data?.cableLinks]);
+
+  const candidatePortId = connectMode && pendingLink ? pendingLink.a.id : null;
 
   const derivedNodes = useMemo<Node[]>(() => {
     const serverNodes = topologyQuery.data?.nodes || [];
     return serverNodes.map((node) => ({
       ...node,
-      data: {
-        ...node.data,
-        highlighted: highlightedDeviceId === node.data.device.id,
-        selectedPortId: selectedPort?.id,
-        candidatePortId,
-        onPortClick: (port: Port) => {
-          if (!connectMode) {
-            setSelectedPort(port);
-            setEditingCable(null);
-            setPendingLink(null);
-            setCableNo('');
-            setLabel('');
-            setNotes('');
-            return;
-          }
-          const normalizedPending = pendingLink;
-          if (!normalizedPending || !normalizedPending.b) {
-            setPendingLink({ a: port });
-            setSelectedPort(port);
-            setCableNo('');
-            setLabel('');
-            setNotes('');
-            return;
-          }
-          if (normalizedPending.a.id === port.id) {
-            setPendingLink(null);
-            setSelectedPort(null);
-            return;
-          }
-          setPendingLink({ ...normalizedPending, b: port });
-          setCableNo('');
-          setLabel(`${normalizedPending.a.name} - ${port.name}`);
-          setNotes('');
-          setSelectedCable(null);
-          setActiveRailTool('inspector');
-          setRailWorkspace((current) => (current.activeTool === 'inspector' ? current : { ...current, activeTool: 'inspector' }));
-        },
-      },
+      data: (() => {
+        const device = node.data.device as Device;
+        const layoutKey = devicePortLayouts[device.id] || (device.role === 'server' ? 'single-row' : switchPortLayoutKey);
+        const layoutTemplate = getSwitchPortLayout(layoutKey);
+        return {
+          ...node.data,
+          highlighted: highlightedDeviceId === device.id,
+          selectedPortId: selectedPort?.id,
+          candidatePortId,
+          portLayoutColumns: layoutTemplate.columns,
+          portLayoutRows: layoutTemplate.rows,
+          portLayoutArrangement: layoutTemplate.arrangement,
+          hideVirtualPorts: layoutTemplate.hideVirtual,
+          compact: layoutTemplate.compact,
+          linkedPortIds,
+          onPortClick: (port: Port, event?: MouseEvent<HTMLButtonElement>) => {
+            const quickConnect = Boolean(event?.ctrlKey || event?.metaKey);
+            if (!connectMode && !quickConnect) {
+              setSelectedPort(port);
+              setEditingCable(null);
+              setPendingLink(null);
+              return;
+            }
+
+            if (quickConnect && !connectMode) {
+              setConnectMode(true);
+            }
+
+            if (!pendingLink) {
+              setPendingLink({ a: port });
+              setSelectedPort(port);
+              setCableNo('');
+              setLabel('');
+              setVlanId('');
+              setNotes('');
+              return;
+            }
+
+            if (!pendingLink.b) {
+              if (pendingLink.a.id === port.id) {
+                clearCableForm();
+                setConnectMode(false);
+                return;
+              }
+              const inferredVlan = inferCableVlan(pendingLink.a, port);
+              setPendingLink({ ...pendingLink, b: port });
+              setEditingCable(null);
+              setCableNo('');
+              setLabel(`${pendingLink.a.name} - ${port.name}`);
+              setVlanId(inferredVlan ? String(inferredVlan) : '');
+              setNotes('');
+              setSelectedPort(port);
+              setActiveRailTool('inspector');
+              setRailWorkspace((current) => (current.activeTool === 'inspector' ? current : { ...current, activeTool: 'inspector' }));
+              return;
+            }
+            clearCableForm();
+          },
+        };
+      })(),
     }));
-  }, [candidatePortId, connectMode, highlightedDeviceId, pendingLink, selectedPort, topologyQuery.data?.nodes]);
+  }, [candidatePortId, connectMode, devicePortLayouts, highlightedDeviceId, linkedPortIds, pendingLink, selectedPort?.id, switchPortLayoutKey, topologyQuery.data?.nodes]);
 
   const [nodes, setNodes] = useState<Node[]>([]);
 
@@ -379,8 +464,42 @@ export function TopologyPage() {
     });
   }, [derivedNodes, movedNodes]);
 
-  const edges = useMemo<Edge[]>(() => (topologyQuery.data?.edges || []).map((edge) => ({ ...edge, animated: false })), [topologyQuery.data?.edges]);
+  const edges = useMemo<Edge[]>(
+    () => {
+      const nodeById = new Map(nodes.map((node) => [node.id, node]));
+      return (topologyQuery.data?.edges || []).map((edge) => {
+        const linkId = edgeLinkId(edge);
+        const highlighted = highlightedCableId !== null && linkId === highlightedCableId;
+        const edgeVlan = edgeVlanId(edge);
+        const baseStrokeWidth = edgeStrokeWidth(edge.style?.strokeWidth);
+        const anchor = verticalPortAnchor(edge, nodeById);
+        return {
+          ...edge,
+          sourceHandle: portHandleWithSide(edge.sourceHandle, anchor.source),
+          targetHandle: portHandleWithSide(edge.targetHandle, anchor.target),
+          label: edge.label || (edgeVlan ? `VLAN ${edgeVlan}` : undefined),
+          animated: highlighted,
+          selected: highlighted,
+          interactionWidth: 8,
+          zIndex: highlighted ? 40 : 30,
+          style: {
+            ...(edge.style || {}),
+            strokeWidth: highlighted ? 4 : baseStrokeWidth,
+          },
+        };
+      });
+    },
+    [highlightedCableId, nodes, topologyQuery.data?.edges],
+  );
   const deviceById = useMemo(() => new Map((topologyQuery.data?.devices || []).map((device) => [device.id, device])), [topologyQuery.data?.devices]);
+  const portById = useMemo(() => new Map((topologyQuery.data?.ports || []).map((port) => [port.id, port])), [topologyQuery.data?.ports]);
+  const inspectCablePorts = useMemo(() => {
+    if (!editingCable) return null;
+    return {
+      endpointAPort: portById.get(editingCable.endpointAPortId) || null,
+      endpointBPort: portById.get(editingCable.endpointBPortId) || null,
+    };
+  }, [editingCable, portById]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -394,15 +513,13 @@ export function TopologyPage() {
         });
         if (Object.keys(moved).length) {
           setMovedNodes((current) => ({ ...current, ...moved }));
-          setLayoutDirty(true);
+          setHasLayoutDirty(true);
         }
         return nextNodes;
       });
     },
     [],
   );
-
-  const candidatePort = pendingLink?.b;
 
   function applyLayoutViewport(topologyIdValue: number | null) {
     if (!flowInstance || topologyIdValue == null || hasRestoredViewport) return;
@@ -431,14 +548,32 @@ export function TopologyPage() {
     if (typeof edgeCableId !== 'number') return;
     const targetCable = (topologyQuery.data?.cableLinks || []).find((cable) => cable.id === edgeCableId);
     if (!targetCable) return;
+    if (connectMode) {
+      setConnectMode(false);
+    }
     setEditingCable(targetCable);
+    setHighlightedCableId(targetCable.id);
     setSelectedPort(null);
     setPendingLink(null);
     setCableNo(targetCable.cableNo || '');
     setLabel(targetCable.label || '');
+    setVlanId(targetCable.vlanId ? String(targetCable.vlanId) : '');
     setNotes(targetCable.notes || '');
     setActiveRailTool('inspector');
     setRailWorkspace((current) => (current.activeTool === 'inspector' ? current : { ...current, activeTool: 'inspector' }));
+  }
+
+  function handleNodeClick(_: unknown, node: Node) {
+    const device = (node.data as { device?: Device }).device;
+    if (!device?.id) return;
+    setHighlightedDeviceId(device.id);
+    setSelectedPort(null);
+  }
+
+  function handleNodeDoubleClick(_: unknown, node: Node) {
+    const device = (node.data as { device?: Device }).device;
+    if (!device?.id) return;
+    openDeviceEditor(device);
   }
 
   useEffect(() => {
@@ -449,9 +584,8 @@ export function TopologyPage() {
     if (!connectMode) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
-        setPendingLink(null);
-        setSelectedPort(null);
-        setEditingCable(null);
+        setConnectMode(false);
+        clearCableForm();
       }
     }
     window.addEventListener('keydown', onKeyDown);
@@ -490,6 +624,7 @@ export function TopologyPage() {
     .filter((device): device is Device => Boolean(device));
   const canAddTopologyDevices = topologyId !== null && selectedTopologyDevices.length > 0;
   const topologyDevices = topologyQuery.data?.devices || [];
+  const highlightedDevice = highlightedDeviceId ? topologyDevices.find((device) => device.id === highlightedDeviceId) || null : null;
   const filteredTopologyDevices = topologyDevices.filter((device) => {
     const search = deviceOverviewSearch.trim().toLowerCase();
     const roleMatch =
@@ -507,6 +642,10 @@ export function TopologyPage() {
       .includes(search);
   });
   const topologyPorts = topologyQuery.data?.ports || [];
+  const editingDevicePorts = useMemo(
+    () => (editingDevice ? topologyPorts.filter((port) => port.deviceId === editingDevice.id) : []),
+    [editingDevice, topologyPorts],
+  );
   const cableLinks = topologyQuery.data?.cableLinks || [];
   const switchCount = topologyDevices.filter((device) => device.role === 'switch').length;
   const serverCount = topologyDevices.filter((device) => device.role === 'server').length;
@@ -538,22 +677,27 @@ export function TopologyPage() {
       ? `${selectedTopologyDevices.length} 待加入`
       : activeRailTool === 'discovery'
         ? discoverySummaryText
-        : selectedPort
-          ? `${deviceById.get(selectedPort.deviceId)?.displayName || '-'} · ${selectedPort.name}`
-          : editingCable
-            ? `编辑线缆 ${editingCable.id}`
+        : editingCable
+          ? `编辑线缆 ${editingCable.id}`
+          : selectedPort
+            ? `${deviceById.get(selectedPort.deviceId)?.displayName || '-'} · ${selectedPort.name}`
             : pendingLink
               ? '已选线缆'
               : '未选择';
-  const hasPendingSecondPort = Boolean(pendingLink?.b);
 
   function submitCable(event: FormEvent) {
     event.preventDefault();
+    const parsedVlan = parseVlanInput(vlanId);
+    if (!parsedVlan.ok) {
+      feedback.pushToast(parsedVlan.message, 'error');
+      return;
+    }
     if (editingCable) {
       updateCable.mutate({
         id: editingCable.id,
         cableNo: cableNo.trim() || null,
         label: label.trim() || null,
+        vlanId: parsedVlan.value,
         notes: notes.trim() || null,
       });
       return;
@@ -564,203 +708,22 @@ export function TopologyPage() {
       endpointBPortId: pendingLink.b.id,
       cableNo: cableNo.trim() || undefined,
       label: label.trim() || undefined,
+      vlanId: parsedVlan.value ?? undefined,
       notes: notes.trim() || undefined,
       color: '#3274d9',
     });
-  }
-            return;
-          }
-          setPendingLink({ ...pendingLink, b: port });
-          setCableNo('');
-          setLabel(`${pendingLink.a.name} - ${port.name}`);
-          setNotes('');
-          setSelectedCable(null);
-          setActiveRailTool('inspector');
-          setRailWorkspace((current) => (current.activeTool === 'inspector' ? current : { ...current, activeTool: 'inspector' }));
-        },
-      },
-    }));
-  }, [candidatePortId, connectMode, highlightedDeviceId, pendingLink, selectedPort, topologyId, topologyQuery.data?.nodes]);
-
-  const [nodes, setNodes] = useState<Node[]>([]);
-
-  useEffect(() => {
-    setNodes((currentNodes) => {
-      const currentById = new Map(currentNodes.map((node) => [node.id, node]));
-      return derivedNodes.map((node) => {
-        const current = currentById.get(node.id);
-        return {
-          ...node,
-          position: movedNodes[node.id] || current?.position || node.position,
-          measured: current?.measured,
-          width: current?.width,
-          height: current?.height,
-          selected: current?.selected,
-          dragging: current?.dragging,
-        };
-      });
-    });
-  }, [derivedNodes, movedNodes]);
-
-  const edges = useMemo<Edge[]>(() => (topologyQuery.data?.edges || []).map((edge) => ({ ...edge, animated: false })), [topologyQuery.data?.edges]);
-  const deviceById = useMemo(() => new Map((topologyQuery.data?.devices || []).map((device) => [device.id, device])), [topologyQuery.data?.devices]);
-
-  const handleNodesChange = useCallback(
-    (changes: NodeChange[]) => {
-      setNodes((currentNodes) => {
-        const nextNodes = applyNodeChanges(changes, currentNodes);
-        const moved: Record<string, { x: number; y: number }> = {};
-        changes.forEach((change) => {
-          if (change.type === 'position' && 'position' in change && change.position) {
-            moved[change.id] = change.position;
-          }
-        });
-        if (Object.keys(moved).length) {
-          setMovedNodes((current) => ({ ...current, ...moved }));
-          setLayoutDirty(true);
-        }
-        return nextNodes;
-      });
-    },
-    [],
-  );
-
-  function handleFlowInit(instance: ReactFlowInstance) {
-    setFlowInstance(instance);
-    const layoutViewport = topologyQuery.data?.layout?.viewport;
-    if (!layoutViewport || typeof layoutViewport !== 'object') return;
-    const x = Number((layoutViewport as { x?: number }).x);
-    const y = Number((layoutViewport as { y?: number }).y);
-    const zoom = Number((layoutViewport as { zoom?: number }).zoom);
-    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(zoom)) {
-      instance.setViewport({ x, y, zoom });
-    }
+    setConnectMode(false);
   }
 
-  useEffect(() => {
-    if (!flowInstance || !topologyId) return;
-    const layoutViewport = topologyQuery.data?.layout?.viewport;
-    if (!layoutViewport || typeof layoutViewport !== 'object') return;
-    const x = Number((layoutViewport as { x?: number }).x);
-    const y = Number((layoutViewport as { y?: number }).y);
-    const zoom = Number((layoutViewport as { zoom?: number }).zoom);
-    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(zoom)) {
-      flowInstance.setViewport({ x, y, zoom });
-    }
-  }, [flowInstance, topologyId, topologyQuery.data?.layout?.viewport]);
-
-  useEffect(() => {
-    if (!connectMode) {
-      return;
-    }
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        setPendingLink(null);
-        setSelectedPort(null);
-        setEditingCable(null);
-      }
-    }
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [connectMode]);
-
-  const zabbixChecking = syncStatus.isLoading;
-  const zabbixConfigured = syncStatus.data?.zabbixConfigured === true;
-  const zabbixUnavailable = syncStatus.isSuccess && !zabbixConfigured;
-  const discoveryError = discovered.error instanceof Error ? discovered.error.message : null;
-  const discoveredDevices = discovered.data || [];
-  const unsyncedDiscovered = discoveredDevices.filter((device) => !device.synced);
-  const syncedDiscovered = discoveredDevices.filter((device) => device.synced);
-  const topologyDeviceIds = useMemo(
-    () => new Set((topologyQuery.data?.devices || []).map((device) => device.id)),
-    [topologyQuery.data?.devices],
-  );
-  const allDeviceById = useMemo(
-    () => new Map((devices.data || []).map((device: Device) => [device.id, device])),
-    [devices.data],
-  );
-  const availableDevices = (devices.data || []).filter((device: Device) => device.enabled && !topologyDeviceIds.has(device.id));
-  const normalizedDeviceSearch = deviceSearch.trim().toLowerCase();
-  const filteredAvailableDevices = availableDevices.filter((device: Device) => {
-    if (!normalizedDeviceSearch) return true;
-    return [device.displayName, device.mgmtIp, device.model, device.source, device.role]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase()
-      .includes(normalizedDeviceSearch);
-  });
-  const selectableAvailableDevices = filteredAvailableDevices.filter((device: Device) => !topologyDeviceSelection.has(device.id));
-  const selectedTopologyDevices = useMemo(() => Array.from(topologyDeviceSelection), [topologyDeviceSelection]);
-  const selectedAvailableDevices = selectedTopologyDevices
-    .map((deviceId) => allDeviceById.get(deviceId))
-    .filter((device): device is Device => Boolean(device));
-  const canAddTopologyDevices = topologyId !== null && selectedTopologyDevices.length > 0;
-  const topologyDevices = topologyQuery.data?.devices || [];
-  const filteredTopologyDevices = topologyDevices.filter((device) => {
-    const search = deviceOverviewSearch.trim().toLowerCase();
-    const roleMatch =
-      deviceRoleFilter === 'all'
-        ? true
-        : deviceRoleFilter === 'custom'
-          ? device.role !== 'switch' && device.role !== 'server'
-          : device.role === deviceRoleFilter;
-    if (!roleMatch) return false;
-    if (!search) return true;
-    return [device.displayName, device.mgmtIp, device.model, device.source, device.role]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase()
-      .includes(search);
-  });
-  const topologyPorts = topologyQuery.data?.ports || [];
-  const cableLinks = topologyQuery.data?.cableLinks || [];
-  const switchCount = topologyDevices.filter((device) => device.role === 'switch').length;
-  const serverCount = topologyDevices.filter((device) => device.role === 'server').length;
-  const customCount = topologyDevices.filter((device) => device.role !== 'switch' && device.role !== 'server').length;
-  const noPortAvailableCount = availableDevices.filter((device: Device) => device.stale).length;
-  const upPortCount = topologyPorts.filter((port) => port.operStatus === 'up').length;
-  const latestSync = syncStatus.data?.latest;
-  const syncStatusValue = zabbixUnavailable ? 'unknown' : latestSync?.status === 'failed' ? 'critical' : zabbixConfigured ? 'ok' : 'unknown';
-  const syncStatusText = zabbixChecking
-    ? '检查中'
-    : zabbixUnavailable
-      ? '未配置'
-      : latestSync?.status === 'success'
-        ? '同步正常'
-        : latestSync?.status === 'failed'
-        ? '同步失败'
-          : '待同步';
-  const discoverySummaryText = !zabbixConfigured
-    ? '未配置'
-    : activeRailTool !== 'discovery'
-      ? '未展开'
-      : discovered.isFetching
-        ? '加载中'
-        : discoveryError
-          ? '错误'
-          : `${unsyncedDiscovered.length} 待导入`;
-  const workspaceBadge =
-    activeRailTool === 'members'
-      ? `${selectedTopologyDevices.length} 待加入`
-      : activeRailTool === 'discovery'
-        ? discoverySummaryText
-        : selectedPort
-          ? `${deviceById.get(selectedPort.deviceId)?.displayName || '-'} · ${selectedPort.name}`
-          : pendingLink
-            ? '已选线缆'
-            : '未选择';
-
-  function submitCable(event: FormEvent) {
-    event.preventDefault();
-    if (!pendingLink || !topologyId) return;
-    createCable.mutate({
-      endpointAPortId: pendingLink.a.id,
-      endpointBPortId: pendingLink.b.id,
-      cableNo: cableNo.trim() || undefined,
-      label: label.trim() || undefined,
-      notes: notes.trim() || undefined,
-      color: '#3274d9',
-    });
+  function clearCableForm() {
+    setPendingLink(null);
+    setSelectedPort(null);
+    setEditingCable(null);
+    setCableNo('');
+    setLabel('');
+    setVlanId('');
+    setNotes('');
+    setHighlightedCableId(null);
   }
 
   function submitTopology(event: FormEvent) {
@@ -768,11 +731,39 @@ export function TopologyPage() {
     createTopology.mutate();
   }
 
+  function confirmDeleteCable() {
+    if (!editingCable) return;
+    void feedback
+      .confirm({
+        title: '删除线缆',
+        message: `确认删除该线缆 ${editingCable.label || editingCable.cableNo || '' ? `（${editingCable.label || editingCable.cableNo}）` : ''}？`,
+        confirmText: '确认删除',
+        danger: true,
+      })
+      .then((confirmed) => {
+        if (confirmed) {
+          deleteCable.mutate(editingCable.id);
+        }
+      });
+  }
+
+  function toggleConnectMode() {
+    clearCableForm();
+    setConnectMode((current) => {
+      return !current;
+    });
+  }
+
+  function clearConnectMode() {
+    clearCableForm();
+    setConnectMode(false);
+  }
+
   useEffect(() => {
-    if (selectedPort || pendingLink) {
+    if (selectedPort || pendingLink || editingCable) {
       setRailWorkspace((current) => (current.activeTool === 'inspector' ? current : { ...current, activeTool: 'inspector' }));
     }
-  }, [pendingLink, selectedPort]);
+  }, [editingCable, pendingLink, selectedPort]);
 
   function toggleDiscovery(hostid: string) {
     const next = new Set(discoveredSelection);
@@ -811,6 +802,74 @@ export function TopologyPage() {
     setSelectedPort(null);
   }
 
+  function openDeviceEditor(device: Device) {
+    setHighlightedDeviceId(device.id);
+    setSelectedPort(null);
+    setEditingDevice(device);
+  }
+
+  function setDeviceLayout(deviceId: number, layoutKey: string) {
+    setDevicePortLayouts((current) => ({ ...current, [deviceId]: layoutKey }));
+  }
+
+  function confirmDeleteDevice(device: Device) {
+    void feedback
+      .confirm({
+        title: '删除设备',
+        message: `删除设备「${device.displayName}」及其端口和线缆？`,
+        confirmText: '确认删除',
+        danger: true,
+      })
+      .then((confirmed) => {
+        if (confirmed) {
+          deleteDevice.mutate(device.id);
+        }
+      });
+  }
+
+  async function saveDeviceYaml(yamlText: string) {
+    if (!editingDevice) return;
+    try {
+      const document = parseDeviceYaml(yamlText);
+      if (!document.device.displayName?.trim()) {
+        feedback.pushToast('displayName 不能为空', 'error');
+        return;
+      }
+      setSavingDeviceConfig(true);
+      const updated = await api.updateDevice(editingDevice.id, document.device);
+      for (const port of document.ports) {
+        const name = String(port.name || '').trim();
+        if (!name) continue;
+        const payload = {
+          name,
+          alias: port.alias ?? null,
+          operStatus: port.operStatus || 'unknown',
+          adminStatus: port.adminStatus || 'unknown',
+          speedMbps: port.speedMbps ?? null,
+          media: port.media ?? null,
+          macAddress: port.macAddress ?? null,
+          portRole: port.portRole ?? null,
+          vlanSummary: port.vlanSummary ?? null,
+        };
+        if (port.id) {
+          await api.updatePort(port.id, payload);
+        } else {
+          await api.createPort(editingDevice.id, payload);
+        }
+      }
+      setEditingDevice(updated);
+      queryClient.invalidateQueries({ queryKey: queryKeys.devicesAll() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
+      feedback.pushToast('设备和端口配置已保存', 'success');
+    } catch (error) {
+      feedback.pushToast(error instanceof Error ? error.message : 'YAML 无法解析', 'error', 5000);
+    } finally {
+      setSavingDeviceConfig(false);
+    }
+  }
+
   function setActiveRailTool(tool: RailToolKey) {
     setRailWorkspace((current) => ({ ...current, activeTool: tool }));
   }
@@ -840,15 +899,15 @@ export function TopologyPage() {
     saveLayout.mutate(payload);
   }
 
-  const hasUnsavedLayout = layoutDirty;
+  const hasUnsavedLayout = hasLayoutDirty;
 
   useEffect(() => {
-    if (!topologyId || !layoutDirty) return;
+    if (!topologyId || !hasLayoutDirty) return;
     const timer = window.setTimeout(() => {
       saveCurrentLayout();
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [layoutDirty, nodes, topologyId]);
+  }, [hasLayoutDirty, nodes, topologyId]);
 
   async function exportJson() {
     if (!topologyId) return;
@@ -878,73 +937,46 @@ export function TopologyPage() {
 
   return (
     <div className="page topology-page">
-      <div className="workstation-toolbar">
-        <div className="toolbar-group">
-          <select
-            value={topologyId ?? ''}
-            onChange={(event) => handleTopologyChange(event.target.value)}
-            aria-label="当前拓扑"
-          >
-            {(topologies.data || []).map((topology) => (
-              <option key={topology.id} value={topology.id}>
-                {topology.name}
-              </option>
-            ))}
-          </select>
-          <button
-            className="icon-button"
-            onClick={() => runSync.mutate()}
-            title={zabbixUnavailable ? 'Zabbix 未配置' : '同步并导入 Zabbix 主机'}
-            disabled={!zabbixConfigured || runSync.isPending}
-          >
-            <RefreshCw size={17} />
-          </button>
-          <button className="text-button" onClick={saveCurrentLayout} disabled={!nodes.length || saveLayout.isPending}>
-            <Save size={16} />保存布局
-          </button>
-          <button className="icon-button" onClick={exportJson} title="导出 JSON" disabled={!topologyId}>
-            <Download size={17} />
-          </button>
-          <button className="icon-button" onClick={() => jsonImportRef.current?.click()} title="导入 JSON" disabled={!topologyId || importTopologyJson.isPending}>
-            <Upload size={17} />
-          </button>
-          <input
-            ref={jsonImportRef}
-            type="file"
-            accept="application/json,.json"
-            hidden
-            onChange={(event) => {
-              importJsonFile(event.target.files?.[0] || null);
-              event.target.value = '';
-            }}
-          />
-        </div>
-        <form className="topology-create toolbar-group" onSubmit={submitTopology}>
-          <input value={newTopologyName} onChange={(event) => setNewTopologyName(event.target.value)} placeholder="新建拓扑名称" />
-          <label>
-            <input
-              type="checkbox"
-              checked={newTopologyDefault}
-              onChange={(event) => setNewTopologyDefault(event.target.checked)}
-            />
-            设为默认
-          </label>
-          <button className="text-button" type="submit" disabled={createTopology.isPending}>
-            <Plus size={16} />新建
-          </button>
-        </form>
-        <div className="toolbar-spacer" />
-        <div className="workstation-stats">
-          <span>{topologyQuery.data?.topologyName || '加载中'}</span>
-          <span>{topologyDevices.length} 设备</span>
-          <span>{switchCount} 交换机</span>
-          <span>{upPortCount}/{topologyPorts.length} up</span>
-          <span>{cableLinks.length} 线缆</span>
-          <span>{availableDevices.length} 台可加入</span>
-          <span>发现 {discoverySummaryText}</span>
-          <span className="status-inline">Zabbix {syncStatusText}<StatusPill value={syncStatusValue} /></span>
-        </div>
-      </div>
+      <TopologyToolbar
+        topologyId={topologyId}
+        topologies={topologies.data || []}
+        topologyName={topologyQuery.data?.topologyName || '加载中'}
+        onTopologyChange={handleTopologyChange}
+        zabbixUnavailable={zabbixUnavailable}
+        zabbixConfigured={zabbixConfigured}
+        runSyncPending={runSync.isPending}
+        onRunSync={() => runSync.mutate()}
+        connectMode={connectMode}
+        onToggleConnectMode={toggleConnectMode}
+        switchPortLayoutKey={switchPortLayoutKey}
+        onSwitchPortLayoutChange={setSwitchPortLayoutKey}
+        connectModeText={connectMode ? connectModeStatusText(pendingLink) : null}
+        hasUnsavedLayout={hasUnsavedLayout}
+        onSaveLayout={saveCurrentLayout}
+        saveLayoutPending={saveLayout.isPending}
+        canSaveLayout={nodes.length > 0}
+        onExportJson={exportJson}
+        importTopologyPending={importTopologyJson.isPending}
+        jsonImportRef={jsonImportRef}
+        onImportJsonFile={importJsonFile}
+        newTopologyName={newTopologyName}
+        onNewTopologyNameChange={setNewTopologyName}
+        newTopologyDefault={newTopologyDefault}
+        onNewTopologyDefaultChange={setNewTopologyDefault}
+        onSubmitTopology={submitTopology}
+        createTopologyPending={createTopology.isPending}
+        stats={{
+          deviceCount: topologyDevices.length,
+          switchCount,
+          upPortCount,
+          portCount: topologyPorts.length,
+          cableCount: cableLinks.length,
+          availableDeviceCount: availableDevices.length,
+          discoverySummaryText,
+          syncStatusText,
+          syncStatusValue,
+        }}
+      />
 
       <div className="topology-content">
         <div className="topology-primary">
@@ -954,9 +986,13 @@ export function TopologyPage() {
                 nodes={nodes}
                 edges={edges}
                 nodeTypes={nodeTypes}
+                onInit={handleFlowInit}
                 fitView
                 fitViewOptions={{ padding: 0.18, maxZoom: 1 }}
                 onNodesChange={handleNodesChange}
+                onNodeClick={handleNodeClick}
+                onNodeDoubleClick={handleNodeDoubleClick}
+                onEdgeClick={handleEdgeClick}
                 minZoom={0.25}
                 maxZoom={1.6}
               >
@@ -976,6 +1012,31 @@ export function TopologyPage() {
                 </button>
               </div>
             )}
+            {pendingLink?.b ? (
+              <form className="canvas-tag-panel" onSubmit={submitCable}>
+                <strong>
+                  {deviceById.get(pendingLink.a.deviceId)?.displayName || '-'} / {pendingLink.a.name}
+                  <span> → </span>
+                  {deviceById.get(pendingLink.b.deviceId)?.displayName || '-'} / {pendingLink.b.name}
+                </strong>
+                <input value={cableNo} onChange={(event) => setCableNo(event.target.value)} placeholder="线缆编号" />
+                <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="显示标签" />
+                <input
+                  value={vlanId}
+                  onChange={(event) => setVlanId(event.target.value)}
+                  inputMode="numeric"
+                  placeholder="VLAN"
+                />
+                <div className="form-actions">
+                  <button type="button" className="ghost-button" onClick={clearConnectMode}>
+                    取消
+                  </button>
+                  <button type="submit" className="text-button" disabled={createCable.isPending}>
+                    {createCable.isPending ? '保存中...' : '保存线缆'}
+                  </button>
+                </div>
+              </form>
+            ) : null}
           </section>
         </div>
 
@@ -1002,45 +1063,82 @@ export function TopologyPage() {
                 type="button"
                 className={`role-filter ${deviceRoleFilter === 'switch' ? 'active' : ''}`}
                 onClick={() => setDeviceRoleFilter(deviceRoleFilter === 'switch' ? 'all' : 'switch')}
+                title="交换机"
               >
                 <RoleIcon role="switch" size={14} />
-                <span>交换机</span>
+                <span className="sr-only">交换机</span>
                 <strong>{switchCount}</strong>
               </button>
               <button
                 type="button"
                 className={`role-filter ${deviceRoleFilter === 'server' ? 'active' : ''}`}
                 onClick={() => setDeviceRoleFilter(deviceRoleFilter === 'server' ? 'all' : 'server')}
+                title="服务器"
               >
                 <RoleIcon role="server" size={14} />
-                <span>服务器</span>
+                <span className="sr-only">服务器</span>
                 <strong>{serverCount}</strong>
               </button>
               <button
                 type="button"
                 className={`role-filter ${deviceRoleFilter === 'custom' ? 'active' : ''}`}
                 onClick={() => setDeviceRoleFilter(deviceRoleFilter === 'custom' ? 'all' : 'custom')}
+                title="其他设备"
               >
                 <RoleIcon role="custom" size={14} />
-                <span>其他</span>
+                <span className="sr-only">其他</span>
                 <strong>{customCount}</strong>
               </button>
             </div>
+            {highlightedDevice ? (
+              <div className="device-layout-editor">
+                <div className="rail-meta compact">
+                  <span>布局 <strong>{highlightedDevice.displayName}</strong></span>
+                </div>
+                <div className="layout-option-strip">
+                  {switchPortLayoutTemplates.map((template) => (
+                    <button
+                      key={template.key}
+                      type="button"
+                      className={`layout-option ${getDeviceLayoutKey(highlightedDevice, devicePortLayouts, switchPortLayoutKey) === template.key ? 'active' : ''}`}
+                      onClick={() => setDeviceLayout(highlightedDevice.id, template.key)}
+                      title={template.description}
+                    >
+                      {template.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div className="rail-list">
               {filteredTopologyDevices.map((device) => (
-                <button
-                  className={`rail-device clickable ${highlightedDeviceId === device.id ? 'is-active' : ''}`}
-                  type="button"
-                  key={device.id}
-                  onClick={() => focusTopologyDevice(device.id)}
-                >
-                  <RoleIcon role={device.role} />
-                  <span>
-                    <strong>{device.displayName}</strong>
-                    <small>{device.mgmtIp || device.model || device.role}</small>
-                  </span>
-                  <StatusPill value={device.health} />
-                </button>
+                <div className="rail-device-action-row" key={device.id}>
+                  <DeviceCompactCard
+                    device={device}
+                    active={highlightedDeviceId === device.id}
+                    asButton
+                    onClick={() => focusTopologyDevice(device.id)}
+                  />
+                  <button
+                    type="button"
+                    className="icon-button"
+                    title="编辑设备"
+                    aria-label={`编辑设备 ${device.displayName}`}
+                    onClick={() => openDeviceEditor(device)}
+                  >
+                    <PencilLine size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-icon"
+                    title="删除设备"
+                    aria-label={`删除设备 ${device.displayName}`}
+                    onClick={() => confirmDeleteDevice(device)}
+                    disabled={deleteDevice.isPending}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               ))}
               {!topologyDevices.length ? <div className="muted-note">当前拓扑暂无设备。</div> : null}
               {topologyDevices.length > 0 && !filteredTopologyDevices.length ? <div className="muted-note">当前筛选没有匹配设备。</div> : null}
@@ -1062,9 +1160,10 @@ export function TopologyPage() {
                 aria-selected={activeRailTool === 'members'}
                 className={`rail-tab ${activeRailTool === 'members' ? 'active' : ''}`}
                 onClick={() => setActiveRailTool('members')}
+                title="设备加入"
               >
                 <Plus size={14} />
-                <span>设备加入</span>
+                <span className="sr-only">设备加入</span>
                 <strong>{selectedTopologyDevices.length}</strong>
               </button>
               <button
@@ -1073,9 +1172,10 @@ export function TopologyPage() {
                 aria-selected={activeRailTool === 'discovery'}
                 className={`rail-tab ${activeRailTool === 'discovery' ? 'active' : ''}`}
                 onClick={() => setActiveRailTool('discovery')}
+                title="发现导入"
               >
                 <Activity size={14} />
-                <span>发现导入</span>
+                <span className="sr-only">发现导入</span>
                 <strong>{discoverySummaryText}</strong>
               </button>
               <button
@@ -1084,182 +1184,92 @@ export function TopologyPage() {
                 aria-selected={activeRailTool === 'inspector'}
                 className={`rail-tab ${activeRailTool === 'inspector' ? 'active' : ''}`}
                 onClick={() => setActiveRailTool('inspector')}
+                title="端口线缆"
               >
                 <Cable size={14} />
-                <span>端口线缆</span>
+                <span className="sr-only">端口线缆</span>
                 <strong>{selectedPort ? deviceById.get(selectedPort.deviceId)?.displayName || '已选' : '未选择'}</strong>
               </button>
             </div>
 
             <div className="rail-workspace-body">
               {activeRailTool === 'members' ? (
-                availableDevices.length === 0 ? (
-                  <div className="muted-note">当前拓扑已包含全部设备。</div>
-                ) : (
-                  <div className="device-picker">
-                    <div className="rail-workspace-actions">
-                      <button
-                        className="text-button"
-                        type="button"
-                        onClick={addSelectedTopologyDevices}
-                        disabled={!canAddTopologyDevices || attachDevices.isPending}
-                      >
-                        加入 ({selectedTopologyDevices.length})
-                      </button>
-                    </div>
-                    <input
-                      className="rail-search"
-                      value={deviceSearch}
-                      onChange={(event) => setDeviceSearch(event.target.value)}
-                      placeholder="搜索设备、IP、型号"
-                    />
-                    <select
-                      className="rail-select"
-                      value=""
-                      onChange={(event) => addTopologyDeviceToSelection(event.target.value)}
-                      disabled={!selectableAvailableDevices.length}
-                      aria-label="选择可加入设备"
-                    >
-                      <option value="">{selectableAvailableDevices.length ? '从下拉栏选择设备' : '没有匹配设备'}</option>
-                      {selectableAvailableDevices.slice(0, 80).map((device: Device) => (
-                        <option key={device.id} value={device.id}>
-                          {deviceOptionLabel(device)}
-                        </option>
-                      ))}
-                    </select>
-                    <div className="rail-meta compact">
-                      <span>匹配 <strong>{filteredAvailableDevices.length}</strong></span>
-                      <span>无网口 <strong>{noPortAvailableCount}</strong></span>
-                    </div>
-                    {selectedAvailableDevices.length ? (
-                      <div className="selected-device-list">
-                        {selectedAvailableDevices.map((device) => (
-                          <button
-                            type="button"
-                            className="selected-device-chip"
-                            key={device.id}
-                            onClick={() => removeTopologyDeviceSelection(device.id)}
-                            title="点击移除"
-                          >
-                            <RoleIcon role={device.role} size={14} />
-                            <span>
-                              <strong>{device.displayName}</strong>
-                              <small>{device.mgmtIp || device.model || device.source}</small>
-                            </span>
-                            <em>{device.stale ? '无网口' : '待加入'}</em>
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="muted-note tight">先搜索并从下拉栏选择设备。</div>
-                    )}
-                  </div>
-                )
+                <TopologyMembersPanel
+                  availableDevices={availableDevices}
+                  selectedTopologyDevices={selectedTopologyDevices}
+                  selectedAvailableDevices={selectedAvailableDevices}
+                  filteredAvailableDevicesCount={filteredAvailableDevices.length}
+                  selectableAvailableDevices={selectableAvailableDevices}
+                  noPortAvailableCount={noPortAvailableCount}
+                  canAddTopologyDevices={canAddTopologyDevices}
+                  attachDevicesPending={attachDevices.isPending}
+                  deviceSearch={deviceSearch}
+                  onDeviceSearchChange={setDeviceSearch}
+                  onAddTopologyDeviceToSelection={addTopologyDeviceToSelection}
+                  onRemoveTopologyDeviceSelection={removeTopologyDeviceSelection}
+                  onAddSelectedTopologyDevices={addSelectedTopologyDevices}
+                />
               ) : activeRailTool === 'discovery' ? (
-                zabbixChecking ? (
-                  <div className="muted-note">正在检查 Zabbix 配置...</div>
-                ) : zabbixUnavailable ? (
-                  <div className="muted-note">Zabbix 未配置，发现与同步已暂停。</div>
-                ) : discoveryError ? (
-                  <div className="muted-note error-text">
-                    <strong>Zabbix 发现失败</strong>
-                    <span>{discoveryError}</span>
-                  </div>
-                ) : discovered.isLoading ? (
-                  <div className="muted-note">正在加载发现设备...</div>
-                ) : discoveredDevices.length === 0 ? (
-                  <div className="muted-note">暂无可导入的 Zabbix 设备。</div>
-                ) : (
-                  <>
-                    <div className="rail-meta">
-                      <span>已同步 <strong>{syncedDiscovered.length}</strong></span>
-                      <span>未同步 <strong>{unsyncedDiscovered.length}</strong></span>
-                    </div>
-                    <div className="rail-workspace-actions">
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={() => discovered.refetch()}
-                        disabled={zabbixChecking || !zabbixConfigured || discovered.isFetching}
-                      >
-                        {discovered.isFetching ? '刷新中...' : '刷新'}
-                      </button>
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={() => importAll.mutate()}
-                        disabled={zabbixChecking || !zabbixConfigured || discovered.isFetching || unsyncedDiscovered.length === 0 || importAll.isPending}
-                      >
-                        <Check size={16} />
-                        全部导入
-                      </button>
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={applyHostSelection}
-                        disabled={zabbixChecking || !zabbixConfigured || !discoveredSelection.size || importSelected.isPending}
-                      >
-                        导入选中
-                      </button>
-                    </div>
-                    <div className="discovery-list">
-                      {discoveredDevices.map((item: ZabbixDiscoveredDevice) => (
-                        <label className="discovery-row" key={item.zabbixHostid}>
-                          <input
-                            type="checkbox"
-                            checked={discoveredSelection.has(item.zabbixHostid)}
-                            onChange={() => toggleDiscovery(item.zabbixHostid)}
-                            disabled={item.synced}
-                          />
-                          <span className="discovery-main">
-                            <strong>{item.displayName}</strong>
-                            <small title={item.model || undefined}>{item.model || item.mgmtIp || '-'}</small>
-                          </span>
-                          <span className="discovery-meta">
-                            <span>{item.role}</span>
-                            <span>{item.portCount} 端口</span>
-                            {item.synced ? <StatusPill value="ok" /> : <span>未导入</span>}
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  </>
-                )
+                <TopologyDiscoveryPanel
+                  zabbixChecking={zabbixChecking}
+                  zabbixUnavailable={zabbixUnavailable}
+                  zabbixConfigured={zabbixConfigured}
+                  discoveryError={discoveryError}
+                  discoveredLoading={discovered.isLoading}
+                  discoveredFetching={discovered.isFetching}
+                  discoveredDevices={discoveredDevices}
+                  syncedCount={syncedDiscovered.length}
+                  unsyncedCount={unsyncedDiscovered.length}
+                  discoveredSelection={discoveredSelection}
+                  importAllPending={importAll.isPending}
+                  importSelectedPending={importSelected.isPending}
+                  onRefresh={() => discovered.refetch()}
+                  onImportAll={() => importAll.mutate()}
+                  onImportSelected={applyHostSelection}
+                  onToggleDiscovery={toggleDiscovery}
+                />
               ) : (
-                <div className="inspector-stack">
-                  <div className="inspector-hint">
-                    {selectedPort
-                      ? `${deviceById.get(selectedPort.deviceId)?.displayName || '-'} · ${selectedPort.name}`
-                      : '选择一个端口开始打标'}
-                  </div>
-                  {pendingLink ? (
-                    <form className="cable-form" onSubmit={submitCable}>
-                      <strong>
-                        {deviceById.get(pendingLink.a.deviceId)?.displayName || '-'} / {pendingLink.a.name}
-                        <span> → </span>
-                        {deviceById.get(pendingLink.b.deviceId)?.displayName || '-'} / {pendingLink.b.name}
-                      </strong>
-                      <input value={cableNo} onChange={(event) => setCableNo(event.target.value)} placeholder="线缆编号，例如 A-01" />
-                      <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="显示标签" />
-                      <textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="备注：机柜、配线架、确认人等" />
-                      <div className="form-actions">
-                        <button type="button" className="ghost-button" onClick={() => setPendingLink(null)}>
-                          取消
-                        </button>
-                        <button type="submit" className="text-button" disabled={createCable.isPending}>
-                          保存线缆
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <div className="muted-note tight">再次点击另一个端口即可创建人工确认线缆。</div>
-                  )}
-                </div>
+                <CableInspector
+                  editingCable={editingCable}
+                  selectedPort={selectedPort}
+                  pendingLink={pendingLink}
+                  deviceById={deviceById}
+                  inspectCablePorts={inspectCablePorts}
+                  cableNo={cableNo}
+                  label={label}
+                  vlanId={vlanId}
+                  notes={notes}
+                  onCableNoChange={setCableNo}
+                  onLabelChange={setLabel}
+                  onVlanIdChange={setVlanId}
+                  onNotesChange={setNotes}
+                  onSubmitCable={submitCable}
+                  onClearCableForm={clearCableForm}
+                  onClearConnectMode={clearConnectMode}
+                  onConfirmDeleteCable={confirmDeleteCable}
+                  createCablePending={createCable.isPending}
+                  updateCablePending={updateCable.isPending}
+                  deleteCablePending={deleteCable.isPending}
+                />
               )}
             </div>
           </section>
         </aside>
       </div>
+      <DeviceEditDialog
+        device={editingDevice}
+        ports={editingDevicePorts}
+        topologyId={topologyId}
+        topologies={topologies.data || []}
+        layoutKey={editingDevice ? getDeviceLayoutKey(editingDevice, devicePortLayouts, switchPortLayoutKey) : switchPortLayoutKey}
+        layoutTemplates={switchPortLayoutTemplates}
+        savingConfig={savingDeviceConfig}
+        importingData={importIpAddr.isPending}
+        onClose={() => setEditingDevice(null)}
+        onSetLayout={setDeviceLayout}
+        onSaveConfig={saveDeviceYaml}
+        onImportIpAddr={(payload) => importIpAddr.mutate(payload)}
+      />
     </div>
   );
 }
@@ -1269,44 +1279,118 @@ function RoleIcon({ role, size = 16 }: { role: string; size?: number }) {
   return <Icon size={size} />;
 }
 
-function deviceOptionLabel(device: Device) {
-  const detail = device.mgmtIp || device.model || device.source;
-  const status = device.stale ? '无网口' : device.role === 'switch' ? '交换机' : device.role === 'server' ? '服务器' : '其他';
-  return [device.displayName, detail, status].filter(Boolean).join(' · ');
+function getDeviceLayoutKey(device: Device, layouts: Record<number, string>, fallback: string) {
+  return layouts[device.id] || (device.role === 'server' ? 'single-row' : fallback);
 }
 
-function RailSection({
-  title,
-  panelKey,
-  open,
-  onToggle,
-  badge,
-  action,
-  children,
-}: {
-  title: string;
-  panelKey: string;
-  open: boolean;
-  onToggle: () => void;
-  badge?: string;
-  action?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className={`rail-section panel ${panelKey} ${open ? 'is-open' : 'is-collapsed'}`}>
-      <button type="button" className="rail-section-toggle" onClick={onToggle} aria-expanded={open}>
-        <span className="rail-section-title">
-          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          <strong>{title}</strong>
-        </span>
-        <span className="rail-section-badge">{badge || ''}</span>
-      </button>
-      {open ? (
-        <div className="rail-section-body">
-          {action ? <div className="rail-section-action">{action}</div> : null}
-          {children}
-        </div>
-      ) : null}
-    </section>
-  );
+function connectModeStatusText(pendingLink: PendingLink | null) {
+  if (!pendingLink) return '连线模式：点击起点端口';
+  if (!pendingLink.b) return '已选起点，点击目标端口';
+  return '已选两端，填写标签保存';
+}
+
+function edgeLinkId(edge: Edge) {
+  const value = edge.data?.linkId;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function edgeVlanId(edge: Edge) {
+  const value = edge.data?.vlan;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function edgeStrokeWidth(value: unknown): number | string {
+  if (typeof value === 'number' || typeof value === 'string') return value;
+  return 3;
+}
+
+type VerticalPortSide = 'top' | 'bottom';
+
+function verticalPortAnchor(edge: Edge, nodeById: Map<string, Node>): { source: VerticalPortSide; target: VerticalPortSide } {
+  const source = nodeById.get(edge.source);
+  const target = nodeById.get(edge.target);
+  if (!source || !target) return fallbackAnchor(edge.id);
+
+  const deltaY = nodeCenterY(target) - nodeCenterY(source);
+  if (deltaY > 24) return { source: 'bottom', target: 'top' };
+  if (deltaY < -24) return { source: 'top', target: 'bottom' };
+  return fallbackAnchor(edge.id);
+}
+
+function nodeCenterY(node: Node) {
+  const measuredHeight = typeof node.measured?.height === 'number' ? node.measured.height : null;
+  const height = measuredHeight ?? (typeof node.height === 'number' ? node.height : 0);
+  return node.position.y + height / 2;
+}
+
+function fallbackAnchor(edgeId: string): { source: VerticalPortSide; target: VerticalPortSide } {
+  const source: VerticalPortSide = stableHash(edgeId) % 2 === 0 ? 'top' : 'bottom';
+  return { source, target: source === 'top' ? 'bottom' : 'top' };
+}
+
+function stableHash(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function portHandleWithSide(handle: string | null | undefined, side: VerticalPortSide) {
+  if (!handle) return handle;
+  return `${handle.replace(/-(top|bottom)$/, '')}-${side}`;
+}
+
+function parseVlanInput(value: string): { ok: true; value: number | null } | { ok: false; message: string } {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: null };
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 4094) {
+    return { ok: false, message: 'VLAN 必须是 1-4094 之间的整数' };
+  }
+  return { ok: true, value: parsed };
+}
+
+function inferCableVlan(a: Port, b: Port) {
+  const vlanA = vlanNumbers(a.vlanSummary);
+  const vlanB = vlanNumbers(b.vlanSummary);
+  const common = [...vlanA].filter((vlan) => vlanB.has(vlan)).sort((left, right) => left - right);
+  if (common.length) return common[0];
+  const fallback = [...vlanA, ...vlanB].sort((left, right) => left - right);
+  return fallback[0] || null;
+}
+
+function vlanNumbers(value?: string | null) {
+  if (!value) return new Set<number>();
+  const numbers = new Set<number>();
+  for (const rawToken of value.replace(/[,/;]/g, ' ').split(/\s+/)) {
+    const token = rawToken.trim().toLowerCase().replace(/^vlan/, '').replace(/^pvid/, '');
+    if (!token) continue;
+    if (token.includes('-')) {
+      const [firstText, lastText] = token.split('-', 2);
+      const first = Number(firstText);
+      const last = Number(lastText);
+      if (Number.isInteger(first) && Number.isInteger(last) && first > 0 && first <= last && last <= 4094 && last - first <= 64) {
+        for (let vlan = first; vlan <= last; vlan += 1) {
+          numbers.add(vlan);
+        }
+      }
+      continue;
+    }
+    const parsed = Number(token);
+    if (Number.isInteger(parsed) && parsed > 0 && parsed <= 4094) {
+      numbers.add(parsed);
+    }
+  }
+  return numbers;
 }

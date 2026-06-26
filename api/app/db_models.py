@@ -34,6 +34,7 @@ class Device(Base, TimestampMixin):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     stale: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    config_overrides_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     topologies: Mapped[list[TopologyDevice]] = relationship(back_populates="device", cascade="all, delete-orphan")
     ports: Mapped[list[Port]] = relationship(back_populates="device", cascade="all, delete-orphan")
@@ -83,6 +84,7 @@ class Port(Base, TimestampMixin):
     admin_status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
     speed_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
     media: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    mac_address: Mapped[str | None] = mapped_column(String(17), nullable=True, index=True)
     port_role: Mapped[str | None] = mapped_column(String(60), nullable=True)
     vlan_summary: Mapped[str | None] = mapped_column(String(240), nullable=True)
     poe_status: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -94,6 +96,7 @@ class Port(Base, TimestampMixin):
     traffic_out_itemid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     oper_itemid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     stale: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    config_overrides_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     device: Mapped[Device] = relationship(back_populates="ports")
     cable_a: Mapped[list[CableLink]] = relationship(
@@ -118,6 +121,7 @@ class CableLink(Base, TimestampMixin):
     endpoint_b_port_id: Mapped[int] = mapped_column(ForeignKey("st_ports.id", ondelete="CASCADE"), index=True)
     label: Mapped[str | None] = mapped_column(String(160), nullable=True)
     cable_no: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    vlan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     color: Mapped[str | None] = mapped_column(String(32), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

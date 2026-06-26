@@ -19,11 +19,12 @@ interface Props {
   topologies: TopologySummary[];
   devices: Device[];
   ports: Port[];
+  currentTopologyId?: number;
   onClose: () => void;
   onNavigate: (to: string) => void;
 }
 
-export function CommandPalette({ open, topologies, devices, ports, onClose, onNavigate }: Props) {
+export function CommandPalette({ open, topologies, devices, ports, currentTopologyId, onClose, onNavigate }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
@@ -35,7 +36,13 @@ export function CommandPalette({ open, topologies, devices, ports, onClose, onNa
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
-  const allItems = useMemo(() => buildItems(topologies, devices, ports, onNavigate), [devices, onNavigate, ports, topologies]);
+  const allItems = useMemo(() => buildItems(topologies, devices, ports, onNavigate, currentTopologyId), [
+    currentTopologyId,
+    devices,
+    onNavigate,
+    ports,
+    topologies,
+  ]);
 
   const groupedItems = useMemo(() => {
     const terms = query
@@ -221,7 +228,10 @@ function CommandSection({
   );
 }
 
-function buildItems(topologies: TopologySummary[], devices: Device[], ports: Port[], onNavigate: (to: string) => void): PaletteItem[] {
+function buildItems(topologies: TopologySummary[], devices: Device[], ports: Port[], onNavigate: (to: string) => void, currentTopologyId?: number): PaletteItem[] {
+  const topologyQuery = currentTopologyId ? `?topologyId=${currentTopologyId}` : '';
+  const portScopeHint = currentTopologyId ? `（当前拓扑）` : '';
+
   const routeItems: PaletteItem[] = [
     {
       id: 'route-topology',
@@ -236,22 +246,22 @@ function buildItems(topologies: TopologySummary[], devices: Device[], ports: Por
     {
       id: 'route-ports',
       label: '端口列表',
-      meta: '查看端口与 VLAN',
+      meta: `查看端口与 VLAN${portScopeHint}`,
       badge: '页面',
-      keywords: ['端口', 'vlan', 'ports'],
+      keywords: ['端口', 'vlan', 'ports', currentTopologyId ? '当前拓扑' : '全部'],
       icon: <Cable size={16} />,
       kind: 'page',
-      action: () => onNavigate('/ports'),
+      action: () => onNavigate(`/ports${topologyQuery}`),
     },
     {
       id: 'route-devices',
       label: '设备管理',
       meta: '设备台账与删除',
       badge: '页面',
-      keywords: ['设备', 'devices'],
+      keywords: ['设备', 'devices', currentTopologyId ? '当前拓扑' : '全部'],
       icon: <ServerCog size={16} />,
       kind: 'page',
-      action: () => onNavigate('/devices'),
+      action: () => onNavigate(`/devices${currentTopologyId ? topologyQuery : ''}`),
     },
     {
       id: 'route-sync',
@@ -328,7 +338,7 @@ function buildItems(topologies: TopologySummary[], devices: Device[], ports: Por
       label: `${port.name}`,
       meta: [port.alias || '', port.vlanSummary || '', port.operStatus || ''].filter(Boolean).join(' · '),
       badge: port.stale ? 'stale' : '端口',
-      keywords: [port.name, port.alias || '', port.vlanSummary || '', port.operStatus || '', port.media || ''],
+      keywords: [port.name, port.alias || '', port.vlanSummary || '', port.macAddress || '', port.operStatus || '', port.media || ''],
       icon: <Cable size={16} />,
       kind: 'port' as const,
       action: () => onNavigate(`/devices/${port.deviceId}?portId=${port.id}`),

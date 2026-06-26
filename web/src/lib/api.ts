@@ -1,6 +1,7 @@
 import type {
   CableLink,
   Device,
+  DeviceProfile,
   Port,
   PortSeries,
   SyncRun,
@@ -8,6 +9,10 @@ import type {
   TopologyGraph,
   TopologySummary,
   ZabbixDiscoveredDevice,
+  IngestPayload,
+  IngestResult,
+  IngestDevicePayload,
+  IpAddrIngestPayload,
 } from '../types';
 
 const basePath = import.meta.env.BASE_URL && import.meta.env.BASE_URL !== '/' ? import.meta.env.BASE_URL.replace(/\/$/, '') : '';
@@ -75,11 +80,16 @@ type DeviceQueryParams = {
   includeDisabled?: boolean;
 };
 
+type DevicePortQueryParams = {
+  includeVirtual?: boolean;
+};
+
 type PortQueryParams = {
   deviceId?: number;
   topologyId?: number;
   status?: string;
   includeStale?: boolean;
+  includeVirtual?: boolean;
   search?: string;
   q?: string;
   limit?: number;
@@ -87,6 +97,7 @@ type PortQueryParams = {
 };
 
 export const api = {
+  deviceProfiles: () => request<DeviceProfile[]>('/api/device-profiles'),
   topology: (topologyId?: number) => request<TopologyGraph>(`/api/topology${topologyId ? `?topologyId=${topologyId}` : ''}`),
   topologies: () => request<TopologySummary[]>('/api/topologies'),
   createTopology: (payload: { name: string; description?: string | null; isDefault?: boolean }) =>
@@ -117,6 +128,26 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  applyDeviceProfile: (deviceId: number, payload: { profileKey: string; replaceProfilePorts?: boolean }) =>
+    request<Device>(`/api/devices/${deviceId}/apply-profile`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  syncPush: (payload: IngestPayload) =>
+    request<IngestResult>('/api/sync/push', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  syncPushFromCommand: (payload: IngestPayload) =>
+    request<IngestResult>('/api/sync/command-push', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  syncIpAddr: (payload: IpAddrIngestPayload) =>
+    request<IngestResult>('/api/sync/ip-addr', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   saveLayout: (
     nodes: Array<{ nodeId: string; x: number; y: number }>,
     layoutKey = 'default',
@@ -129,16 +160,44 @@ export const api = {
   devices: (params: DeviceQueryParams = {}) => request<Device[]>(`/api/devices${queryString(params)}`),
   createDevice: (payload: Partial<Device> & { displayName: string; role: string; ports?: Array<{ name: string; speedMbps?: number | null }> }) =>
     request<Device>('/api/devices', { method: 'POST', body: JSON.stringify(payload) }),
+  syncPushExample: (): IngestPayload => ({
+    source: 'agent',
+    strictPhysicalPorts: true,
+    physicalPortNamePatterns: ['wan', 'lan', 'ge', 'xe', 'xge', 'eth', 'eno', 'ens', 'enp', 'enx', 'em', 'ib', 'bond', 'ten', 'te', 'idrac', 'ipmi', 'bmc', 'ilo'],
+    maxPhysicalPortsPerDevice: null,
+    topologyId: null,
+    devices: [
+      {
+        displayName: 'compute-01',
+        role: 'server',
+        ports: [{ name: 'ens1f0', macAddress: '52:54:00:aa:bb:cc', operStatus: 'up' }],
+      },
+      {
+        displayName: 'tor-01',
+        role: 'switch',
+        ports: [{ name: 'XGE0/1', operStatus: 'up' }],
+      },
+    ],
+    cables: [
+      {
+        endpointA: { displayName: 'tor-01', portName: 'XGE0/1' },
+        endpointB: { macAddress: '52:54:00:aa:bb:cc' },
+        vlanId: 10,
+        label: 'mac-learned uplink',
+      },
+    ],
+  }),
   updateDevice: (id: number, payload: Partial<Device>) => request<Device>(`/api/devices/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteDevice: (id: number) => request<{ ok: boolean }>(`/api/devices/${id}`, { method: 'DELETE' }),
   ports: (params: PortQueryParams = {}) => request<Port[]>(`/api/ports${queryString(params)}`),
-  devicePorts: (id: number) => request<Port[]>(`/api/devices/${id}/ports`),
+  devicePorts: (id: number, params: DevicePortQueryParams = {}) =>
+    request<Port[]>(`/api/devices/${id}/ports${queryString(params)}`),
   createPort: (deviceId: number, payload: Partial<Port> & { name: string }) =>
     request<Port>(`/api/devices/${deviceId}/ports`, { method: 'POST', body: JSON.stringify(payload) }),
   updatePort: (id: number, payload: Partial<Port>) => request<Port>(`/api/ports/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deletePort: (id: number) => request<{ ok: boolean }>(`/api/ports/${id}`, { method: 'DELETE' }),
   portSeries: (id: number, range: string) => request<PortSeries>(`/api/ports/${id}/series?range=${range}`),
-  createCable: (payload: { endpointAPortId: number; endpointBPortId: number; label?: string | null; cableNo?: string | null; color?: string | null; notes?: string | null }) =>
+  createCable: (payload: { endpointAPortId: number; endpointBPortId: number; label?: string | null; cableNo?: string | null; vlanId?: number | null; color?: string | null; notes?: string | null }) =>
     request<CableLink>('/api/cable-links', { method: 'POST', body: JSON.stringify(payload) }),
   updateCable: (id: number, payload: Partial<CableLink>) => request<CableLink>(`/api/cable-links/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteCable: (id: number) => request<{ ok: boolean }>(`/api/cable-links/${id}`, { method: 'DELETE' }),

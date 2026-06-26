@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Search } from 'lucide-react';
+import { Filter, Search, Router } from 'lucide-react';
 import { api } from '../lib/api';
 import { queryKeys } from '../lib/queryKeys';
 import { CopyLinkButton } from '../components/CopyLinkButton';
@@ -24,6 +24,8 @@ export function PortsPage() {
   const speedFilter = parseSpeedFilter(searchParams.get('speed'));
   const includeStaleQuery = searchParams.get('includeStale');
   const includeStale = includeStaleQuery === null ? true : includeStaleQuery !== 'false';
+  const includeVirtualQuery = searchParams.get('includeVirtual');
+  const includeVirtual = includeVirtualQuery === null ? false : includeVirtualQuery === 'true';
 
   const [search, setSearch] = useState(searchQuery);
   const [statusFilter, setStatusFilter] = useState<PortStatusFilter>(statusQuery);
@@ -34,6 +36,7 @@ export function PortsPage() {
       topologyId,
       status: statusFilter === 'all' ? undefined : statusFilter,
       includeStale,
+      includeVirtual,
       search: search.trim(),
     }),
     queryFn: () =>
@@ -41,6 +44,7 @@ export function PortsPage() {
         topologyId,
         status: statusFilter === 'all' ? undefined : statusFilter,
         includeStale,
+        includeVirtual,
         search: search.trim(),
       }),
   });
@@ -67,8 +71,9 @@ export function PortsPage() {
     const speedHint = speedFilter === 'all' ? '全部速率' : speedFilter === 'slow' ? '<1G' : `>=${speedFilter}`;
     const staleHint = includeStale ? '包含 stale' : '排除 stale';
     const statusHint = statusFilter === 'all' ? '全部状态' : statusFilter;
-    return `${scopeLabel} · ${statusHint} · ${mediaHint} · ${speedHint} · ${staleHint}`;
-  }, [scopeLabel, statusFilter, mediaFilter, speedFilter, includeStale]);
+    const virtualHint = includeVirtual ? '含虚拟口' : '仅物理口';
+    return `${scopeLabel} · ${statusHint} · ${mediaHint} · ${speedHint} · ${staleHint} · ${virtualHint}`;
+  }, [scopeLabel, statusFilter, mediaFilter, speedFilter, includeStale, includeVirtual]);
 
   const mediaList = useMemo(() => {
     const items = new Set<string>();
@@ -83,6 +88,18 @@ export function PortsPage() {
   useEffect(() => {
     setSearch(searchQuery);
   }, [searchQuery]);
+
+  useEffect(() => {
+    if (!topologyId) {
+      return;
+    }
+    const hasTopology = (topologies.data || []).some((topology) => topology.id === topologyId);
+    if (!hasTopology && topologies.data?.length) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('topologyId');
+      setSearchParams(next, { replace: true });
+    }
+  }, [searchParams, setSearchParams, topologyId, topologies.data]);
 
   useEffect(() => {
     setStatusFilter(statusQuery);
@@ -126,6 +143,16 @@ export function PortsPage() {
       nextSearch.delete('includeStale');
     } else {
       nextSearch.set('includeStale', 'false');
+    }
+    setSearchParams(nextSearch, { replace: true });
+  }
+
+  function updateIncludeVirtual(next: boolean) {
+    const nextSearch = new URLSearchParams(searchParams);
+    if (next) {
+      nextSearch.set('includeVirtual', 'true');
+    } else {
+      nextSearch.delete('includeVirtual');
     }
     setSearchParams(nextSearch, { replace: true });
   }
@@ -181,7 +208,7 @@ export function PortsPage() {
 
       const device = deviceById.get(port.deviceId);
       if (!terms.length) return true;
-      const haystack = `${port.name} ${port.alias || ''} ${port.vlanSummary || ''} ${device?.displayName || ''} ${device?.mgmtIp || ''}`
+      const haystack = `${port.name} ${port.alias || ''} ${port.vlanSummary || ''} ${port.macAddress || ''} ${device?.displayName || ''} ${device?.mgmtIp || ''}`
         .toLowerCase();
       return terms.every((term) => haystack.includes(term));
     });
@@ -268,6 +295,15 @@ export function PortsPage() {
               包含 stale <strong>{includeStale ? '是' : '否'}</strong>
             </button>
           </label>
+          <button
+            type="button"
+            className={`icon-button ${includeVirtual ? 'is-active' : ''}`}
+            title={includeVirtual ? '已显示虚拟口' : '仅显示物理口'}
+            onClick={() => updateIncludeVirtual(!includeVirtual)}
+          >
+            <Filter size={15} />
+            <Router size={13} />
+          </button>
         </div>
       </section>
 
@@ -281,6 +317,7 @@ export function PortsPage() {
                 <th>状态</th>
                 <th>速率</th>
                 <th>介质</th>
+                <th>MAC</th>
                 <th>VLAN</th>
                 <th>上/下行</th>
                 <th>别名</th>
@@ -296,6 +333,7 @@ export function PortsPage() {
                     <td><StatusPill value={port.operStatus} /></td>
                     <td>{speed(port.speedMbps)}</td>
                     <td>{port.media || '-'}</td>
+                    <td>{port.macAddress || '-'}</td>
                     <td>{port.vlanSummary || '-'}</td>
                     <td>{bps(port.lastTrafficInBps)} / {bps(port.lastTrafficOutBps)}</td>
                     <td>{port.alias || '-'}</td>

@@ -1,12 +1,16 @@
 export const queryKeys = {
   topologies: () => ['topologies'] as const,
   topology: (topologyId?: number | null) => ['topology', { topologyId: topologyId ?? 'default' }] as const,
+  topologyAll: () => ['topology'] as const,
   devices: (params?: Record<string, unknown>) => ['devices', params || {}] as const,
+  devicesAll: () => ['devices'] as const,
   ports: (params?: Record<string, unknown>) => ['ports', params || {}] as const,
+  portsAll: () => ['ports'] as const,
+  deviceProfiles: () => ['device-profiles'] as const,
   topologySyncStatus: () => ['sync-status'] as const,
   syncRuns: (limit: number = 8) => ['sync-runs', limit] as const,
   zabbixDiscovered: (topologyId?: number | null) => ['zabbix-discovered-devices', topologyId ?? 'default'] as const,
-  devicePorts: (deviceId: number) => ['device-ports', deviceId] as const,
+  devicePorts: (deviceId: number, params?: Record<string, unknown>) => ['device-ports', deviceId, params || {}] as const,
+  portSeries: (portId: number | string, range: string) => ['port-series', portId, range] as const,
   commandPaletteData: () => ['command-palette-data'] as const,
 };
-

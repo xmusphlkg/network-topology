@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Check, Copy } from 'lucide-react';
+import { useI18n } from '../i18n/I18nProvider';
 
 type CopyState = 'idle' | 'copied' | 'error';
 
 export function CopyLinkButton() {
   const [state, setState] = useState<CopyState>('idle');
   const timerRef = useRef<number | null>(null);
+  const { t } = useI18n();
 
   useEffect(() => {
     return () => {
@@ -29,7 +31,7 @@ export function CopyLinkButton() {
     timerRef.current = window.setTimeout(() => setState('idle'), 1600);
   }
 
-  const label = state === 'copied' ? '已复制' : state === 'error' ? '复制失败' : '复制链接';
+  const label = state === 'copied' ? t('copyLinkSuccess') : state === 'error' ? t('copyLinkFailed') : t('copyLink');
   const Icon = state === 'copied' ? Check : Copy;
 
   return (
@@ -37,11 +39,12 @@ export function CopyLinkButton() {
       className="text-button copy-link-button"
       type="button"
       onClick={copyCurrentUrl}
-      title="复制当前页面链接"
-      aria-label="复制当前页面链接"
+      title={t('copyLink')}
+      aria-label={t('copyLink')}
+      style={{ width: '34px', justifyContent: 'center' }}
     >
       <Icon size={16} />
-      {label}
+      <span className="sr-only">{label}</span>
     </button>
   );
 }

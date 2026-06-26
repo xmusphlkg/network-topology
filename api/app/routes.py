@@ -30,21 +30,49 @@ from .schemas import (
     SeriesPoint,
     SyncRunRead,
     SyncStatus,
-    LayoutNodeUpdate,
     TopologyCreate,
     TopologyDeviceIds,
     TopologyGraphRead,
     TopologyImportRequest,
     TopologyRead,
+    DeviceProfileApplyRequest,
+    IngestCable,
+    IngestDevice,
+    IngestEndpointRef,
+    IngestPort,
+    IngestRequest,
+    IngestResult,
+    IpAddrIngestRequest,
     TopologyUpdate,
     ZabbixDiscoveredDevice,
-    TopologyEdge,
-    TopologyNode,
 )
-from .services.profiles import PROFILES, port_sort_key, profile_for_model
+from .services.mapper import is_virtual_port_name, normalize_port_name
+from .services.mac import normalize_mac_address
+from .services.manual_overrides import mark_overrides, set_optional_unless_overridden, set_unless_overridden
+from .services.ip_addr import parse_ip_addr_ports
+from .services.profiles import PROFILES, get_profile, is_switch_profile, port_sort_key
+from .services.topology_graph import build_topology_graph, layout_key_for_topology
 from .services.sync import collect_zabbix_snapshots, run_zabbix_sync, run_zabbix_sync_from_snapshots, upsert_zabbix_snapshots
 
 router = APIRouter(prefix="/api")
+
+DEVICE_OVERRIDE_FIELDS = {
+    "displayName": "display_name",
+    "role": "role",
+    "model": "model",
+    "mgmtIp": "mgmt_ip",
+    "enabled": "enabled",
+}
+PORT_OVERRIDE_FIELDS = {
+    "name": "name",
+    "alias": "alias",
+    "speedMbps": "speed_mbps",
+    "media": "media",
+    "macAddress": "mac_address",
+    "portRole": "port_role",
+    "vlanSummary": "vlan_summary",
+    "poeStatus": "poe_status",
+}
 
 
 def zabbix_from_request(request: Request) -> ZabbixClient:
@@ -77,10 +105,6 @@ async def run_zabbix_sync_from_snapshots_serialized(
 ) -> ZabbixSyncRun:
     async with sync_lock_from_request(request):
         return await run_zabbix_sync_from_snapshots(session, settings, snapshots)
-
-
-def layout_key_for_topology(topology_id: int) -> str:
-    return f"topology:{topology_id}"
 
 
 async def get_topology_by_id(session: AsyncSession, topology_id: int) -> Topology:
@@ -447,9 +471,223 @@ async def update_device(device_id: int, payload: DeviceUpdate, session: AsyncSes
     }
     for key, value in data.items():
         setattr(device, field_map.get(key, key), value)
+    mark_overrides(device, {DEVICE_OVERRIDE_FIELDS[key] for key in data if key in DEVICE_OVERRIDE_FIELDS})
     await session.commit()
     await session.refresh(device)
     return device
+
+
+@router.post("/devices/{device_id}/apply-profile", response_model=DeviceRead)
+async def apply_profile_ports(device_id: int, payload: DeviceProfileApplyRequest, session: AsyncSession = Depends(get_session)) -> Device:
+    device = await get_device_or_404(session, device_id)
+    profile = get_profile(payload.profileKey)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    existing_ports = (await session.execute(select(Port).where(Port.device_id == device.id))).scalars().all()
+    if payload.replaceProfilePorts:
+        profile_port_ids = [port.id for port in existing_ports if port.source == "profile"]
+        if profile_port_ids:
+            await session.execute(
+                delete(CableLink).where(
+                    or_(
+                        CableLink.endpoint_a_port_id.in_(profile_port_ids),
+                        CableLink.endpoint_b_port_id.in_(profile_port_ids),
+                    )
+                )
+            )
+            await session.execute(delete(Port).where(Port.id.in_(profile_port_ids)))
+            existing_ports = [port for port in existing_ports if port.id not in profile_port_ids]
+
+    occupied_normalized_names: dict[str, bool] = {}
+    for port in existing_ports:
+        normalized = normalize_port_name(port.name)
+        if normalized:
+            occupied_normalized_names[normalized] = True
+
+    for profile_port in profile.ports:
+        normalized = normalize_port_name(profile_port.name)
+        if not normalized:
+            continue
+        if occupied_normalized_names.get(normalized, False):
+            continue
+        session.add(
+            Port(
+                device_id=device.id,
+                source="profile",
+                identity=f"profile:{normalized}",
+                name=profile_port.name,
+                oper_status="unknown",
+                admin_status="unknown",
+                speed_mbps=profile_port.speed_mbps,
+                media=profile_port.media,
+                port_role=profile_port.role,
+                stale=False,
+            )
+        )
+        occupied_normalized_names[normalized] = True
+
+    if not device.model:
+        device.model = profile.key
+    if is_switch_profile(payload.profileKey) and device.role != "switch":
+        device.role = "switch"
+    elif device.role == "custom":
+        # 如果是非交换机模板且设备仍为自定义类型，保留原角色，避免误改服务器类型。
+        device.role = "custom"
+    await session.commit()
+    await session.refresh(device)
+    return device
+
+
+@router.post("/sync/ingest", response_model=IngestResult)
+async def ingest_from_agent(payload: IngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
+    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts)
+
+
+@router.post("/sync/push", response_model=IngestResult)
+async def push_from_agent(payload: IngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
+    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts)
+
+
+@router.post("/sync/command-push", response_model=IngestResult)
+async def push_from_command(payload: IngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
+    """Endpoint for server-side command runners / automation to submit discovered device inventory."""
+    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts)
+
+
+@router.post("/sync/ip-addr", response_model=IngestResult)
+async def push_from_ip_addr(payload: IpAddrIngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
+    topology = await (get_default_topology(session) if payload.topologyId is None else get_topology_by_id(session, payload.topologyId))
+    ports = parse_ip_addr_ports(payload.output)
+    ingest_payload = IngestRequest(
+        source=payload.source,
+        topologyId=topology.id,
+        strictPhysicalPorts=payload.strictPhysicalPorts,
+        physicalPortNamePatterns=payload.physicalPortNamePatterns,
+        devices=[
+            IngestDevice(
+                displayName=payload.displayName,
+                role="server",
+                mgmtIp=payload.mgmtIp,
+                source=payload.source,
+                ports=[IngestPort(**port) for port in ports],
+                strictPhysicalPorts=payload.strictPhysicalPorts,
+            )
+        ],
+        cables=[],
+    )
+    return await _ingest_payload(session, ingest_payload, strict_physical_ports=payload.strictPhysicalPorts)
+
+
+async def _ingest_payload(
+    session: AsyncSession,
+    payload: IngestRequest,
+    strict_physical_ports: bool,
+) -> IngestResult:
+    topology = None
+    if payload.topologyId is not None:
+        topology = await get_topology_by_id(session, payload.topologyId)
+
+    device_id_cache: dict[str, Device] = {}
+    ports_by_device_key: dict[int, set[str]] = {}
+    cable_count = 0
+    seen_device_ids: set[int] = set()
+    seen_ports = 0
+    physical_name_patterns = _normalize_patterns(payload.physicalPortNamePatterns)
+
+    for device_payload in payload.devices:
+        accepted_physical_count = 0
+        device_strict_physical_ports = strict_physical_ports or device_payload.strictPhysicalPorts
+        device = await _find_or_create_device_for_ingest(session, payload.source, device_payload)
+        seen_device_ids.add(device.id)
+        for key in _ingest_device_cache_keys(device_payload, device):
+            device_id_cache[key] = device
+            seen_device_ids.add(device.id)
+        ports_by_device_key[device.id] = set[str]()
+        await session.flush()
+        if topology is not None:
+            existing = await session.execute(
+                select(TopologyDevice).where(TopologyDevice.topology_id == topology.id, TopologyDevice.device_id == device.id)
+            )
+            if not existing.scalar_one_or_none():
+                session.add(TopologyDevice(topology_id=topology.id, device_id=device.id))
+        for port_payload in device_payload.ports:
+            is_physical = _is_physical_ingest_port(port_payload.name, device_strict_physical_ports, physical_name_patterns)
+            if device_strict_physical_ports and not is_physical:
+                continue
+            if device_strict_physical_ports and payload.maxPhysicalPortsPerDevice is not None and is_physical and accepted_physical_count >= payload.maxPhysicalPortsPerDevice:
+                continue
+            port_identity, upserted = await _upsert_ingest_port(
+                session,
+                device.id,
+                payload.source,
+                port_payload,
+                strict_physical_ports=device_strict_physical_ports,
+            )
+            if upserted:
+                seen_ports += 1
+                if device_strict_physical_ports and is_physical:
+                    accepted_physical_count += 1
+            if port_identity:
+                ports_by_device_key[device.id].add(port_identity)
+
+    # Mark stale ports for this ingest source only, per device.
+    if ports_by_device_key:
+        for device_id, seen_identities in ports_by_device_key.items():
+            if not seen_identities:
+                continue
+            all_ports = await session.execute(
+                select(Port).where(Port.device_id == device_id, Port.source == payload.source)
+            )
+            for port in all_ports.scalars().all():
+                port.stale = _normalize_ingest_port_identity(port.name) not in seen_identities
+
+            # keep devices with any ingest ports active
+            device = await session.get(Device, device_id)
+            if device is not None:
+                device.stale = False
+
+    if payload.cables:
+        # Keep a point-in-time snapshot of devices for endpoint resolution
+        all_device_ids = list(ports_by_device_key.keys())
+        if all_device_ids:
+            existing_ports = await session.execute(select(Port).where(Port.device_id.in_(all_device_ids)))
+            ports_by_device: dict[int, list[Port]] = {}
+            for port in existing_ports.scalars().all():
+                ports_by_device.setdefault(port.device_id, []).append(port)
+        else:
+            ports_by_device = {}
+
+        for cable in payload.cables:
+            endpoint_a = await _resolve_ingest_endpoint(session, cable.endpointA, device_id_cache, ports_by_device)
+            endpoint_b = await _resolve_ingest_endpoint(session, cable.endpointB, device_id_cache, ports_by_device)
+            if endpoint_a is None or endpoint_b is None:
+                continue
+            if endpoint_a == endpoint_b:
+                continue
+            link = await _get_or_create_link(session, endpoint_a, endpoint_b)
+            if cable.cableNo is not None:
+                link.cable_no = cable.cableNo
+            if cable.label is not None:
+                link.label = cable.label
+            if cable.vlanId is not None:
+                link.vlan_id = cable.vlanId
+            if cable.notes is not None:
+                link.notes = cable.notes
+            if cable.color is not None:
+                link.color = cable.color
+            if cable.verifiedAt is not None:
+                link.verified_at = _parse_iso_datetime(cable.verifiedAt)
+            else:
+                link.verified_at = None
+            cable_count += 1
+
+    await session.commit()
+    return IngestResult(
+        devices=len(seen_device_ids),
+        ports=seen_ports,
+        cables=cable_count,
+    )
 
 
 @router.delete("/devices/{device_id}")
@@ -473,10 +711,16 @@ async def delete_device(device_id: int, session: AsyncSession = Depends(get_sess
 
 
 @router.get("/devices/{device_id}/ports", response_model=list[PortRead])
-async def device_ports(device_id: int, session: AsyncSession = Depends(get_session)) -> list[Port]:
+async def device_ports(
+    device_id: int,
+    include_virtual: bool = Query(False, alias="includeVirtual"),
+    session: AsyncSession = Depends(get_session),
+) -> list[Port]:
     await get_device_or_404(session, device_id)
     result = await session.execute(select(Port).where(Port.device_id == device_id))
     ports = list(result.scalars().all())
+    if not include_virtual:
+        ports = [port for port in ports if not is_virtual_port_name(port.name)]
     return sorted(ports, key=lambda port: port_sort_key(port.name))
 
 
@@ -521,6 +765,7 @@ async def ports(
     topology_id: int | None = Query(None, alias="topologyId"),
     status: str | None = Query(None),
     include_stale: bool = Query(True, alias="includeStale"),
+    include_virtual: bool = Query(False, alias="includeVirtual"),
     limit: int | None = Query(None, ge=1),
     offset: int = Query(0, ge=0),
     search: str | None = None,
@@ -540,14 +785,18 @@ async def ports(
         stmt = stmt.where(Port.stale.is_(False))
     if search:
         like = f"%{search}%"
-        stmt = stmt.where(or_(Port.name.like(like), Port.alias.like(like), Port.vlan_summary.like(like)))
+        stmt = stmt.where(or_(Port.name.like(like), Port.alias.like(like), Port.vlan_summary.like(like), Port.mac_address.like(like)))
     stmt = stmt.order_by(Port.device_id, Port.name)
-    if offset:
-        stmt = stmt.offset(offset)
-    if limit is not None:
-        stmt = stmt.limit(limit)
     result = await session.execute(stmt)
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    if not include_virtual:
+        rows = [port for port in rows if not is_virtual_port_name(port.name)]
+
+    if offset:
+        rows = rows[offset:]
+    if limit is not None:
+        rows = rows[:limit]
+    return rows
 
 
 @router.patch("/ports/{port_id}", response_model=PortRead)
@@ -571,12 +820,14 @@ async def update_port(port_id: int, payload: PortUpdate, session: AsyncSession =
         "operStatus": "oper_status",
         "adminStatus": "admin_status",
         "speedMbps": "speed_mbps",
+        "macAddress": "mac_address",
         "portRole": "port_role",
         "vlanSummary": "vlan_summary",
         "poeStatus": "poe_status",
     }
     for key, value in data.items():
         setattr(port, field_map.get(key, key), value)
+    mark_overrides(port, {PORT_OVERRIDE_FIELDS[key] for key in data if key in PORT_OVERRIDE_FIELDS})
     await session.commit()
     await session.refresh(port)
     return port
@@ -589,100 +840,8 @@ async def topology(
 ) -> TopologyGraphRead:
     topology = await (get_default_topology(session) if topologyId is None else get_topology_by_id(session, topologyId))
     await seed_default_memberships(session, topology)
-    device_ids = await get_topology_ids_for_graph(session, topology.id)
-    devices_result = await session.execute(
-        select(Device)
-        .where(Device.enabled.is_(True), Device.stale.is_(False), Device.id.in_(device_ids))
-        .options(selectinload(Device.ports)),
-    )
-    devices = list(devices_result.scalars().all())
-    role_order = {"switch": 0, "server": 1, "custom": 2}
-    devices.sort(key=lambda device: (role_order.get(device.role, 3), device.display_name))
-    ports = [port for device in devices for port in device.ports if not port.stale]
-    port_ids = [port.id for port in ports]
-    if port_ids:
-        links_result = await session.execute(
-            select(CableLink).where(
-                CableLink.endpoint_a_port_id.in_(port_ids),
-                CableLink.endpoint_b_port_id.in_(port_ids),
-            ),
-        )
-        links = list(links_result.scalars().all())
-    else:
-        links = []
-    layout_result = await session.execute(
-        select(TopologyLayout).where(TopologyLayout.layout_key == layout_key_for_topology(topology.id)),
-    )
-    layout_rows = list(layout_result.scalars().all())
-    layout_by_node = {layout.node_id: layout for layout in layout_rows}
-    layout_viewport: dict | None = None
-    for layout_row in layout_rows:
-        if not layout_row.viewport_json:
-            continue
-        try:
-            parsed = json.loads(layout_row.viewport_json)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if isinstance(parsed, dict):
-            layout_viewport = parsed
-            break
-
-    role_indexes = {"switch": 0, "endpoint": 0}
-    nodes = []
-    for device in devices:
-        role_key = "switch" if device.role == "switch" else "endpoint"
-        role_index = role_indexes[role_key]
-        role_indexes[role_key] += 1
-        nodes.append(build_node(device, role_index, layout_by_node.get(f"device-{device.id}")))
-    device_by_port = {port.id: port.device_id for port in ports}
-    edges: list[TopologyEdge] = []
-    for link in links:
-        source_device = device_by_port.get(link.endpoint_a_port_id)
-        target_device = device_by_port.get(link.endpoint_b_port_id)
-        if not source_device or not target_device:
-            continue
-        edges.append(
-            TopologyEdge(
-                id=f"cable-{link.id}",
-                source=f"device-{source_device}",
-                target=f"device-{target_device}",
-                sourceHandle=f"port-{link.endpoint_a_port_id}",
-                targetHandle=f"port-{link.endpoint_b_port_id}",
-                label=link.label or link.cable_no,
-                style={"stroke": link.color or "#4f8cff", "strokeWidth": 2},
-                data={"linkId": link.id, "cableNo": link.cable_no, "notes": link.notes},
-            )
-        )
-
-    return TopologyGraphRead(
-        generatedAt=datetime.now(timezone.utc),
-        topology_id=topology.id,
-        topology_name=topology.name,
-        summary=TopologyRead.model_validate(await hydrate_topology_counts(session, topology)),
-        nodes=nodes,
-        edges=edges,
-        devices=[DeviceRead.model_validate(device) for device in devices],
-        ports=[PortRead.model_validate(port) for port in ports],
-        cableLinks=[CableLinkRead.model_validate(link) for link in links],
-        layout=TopologyLayoutState(
-            topologyId=topology.id,
-            layoutKey=layout_key_for_topology(topology.id),
-            viewport=layout_viewport,
-            nodes=[
-                LayoutNodeUpdate(
-                    nodeId=layout.node_id,
-                    x=layout.x,
-                    y=layout.y,
-                    width=layout.width,
-                    height=layout.height,
-                    groupName=layout.group_name,
-                    hidden=layout.hidden,
-                )
-                for layout in layout_rows
-            ],
-        ),
-        switchPanels=[switch_panel(device) for device in devices if device.role == "switch"],
-    )
+    await hydrate_topology_counts(session, topology)
+    return await build_topology_graph(session, topology)
 
 
 @router.get("/topologies/{topology_id}/json-export")
@@ -809,6 +968,7 @@ def export_endpoint_ref(port_id: int, port_by_id: dict[int, Port], device_by_id:
         "portId": port.id if port else None,
         "portIdentity": port.identity if port else None,
         "portName": port.name if port else None,
+        "macAddress": port.mac_address if port else None,
     }
 
 
@@ -885,6 +1045,7 @@ async def upsert_import_device(session: AsyncSession, data: dict) -> Device:
     device.health = clean_optional_str(data.get("health")) or "unknown"
     device.enabled = bool(data.get("enabled", True))
     device.stale = bool(data.get("stale", False))
+    mark_overrides(device, {"display_name", "role", "model", "mgmt_ip", "enabled"})
     return device
 
 
@@ -910,10 +1071,12 @@ async def upsert_import_port(session: AsyncSession, device: Device, data: dict) 
     port.admin_status = clean_optional_str(data.get("adminStatus") or data.get("admin_status")) or "unknown"
     port.speed_mbps = float_or_none(data.get("speedMbps") or data.get("speed_mbps"))
     port.media = clean_optional_str(data.get("media"))
+    port.mac_address = normalize_mac_address(data.get("macAddress") or data.get("mac_address"))
     port.port_role = clean_optional_str(data.get("portRole") or data.get("port_role"))
     port.vlan_summary = clean_optional_str(data.get("vlanSummary") or data.get("vlan_summary"))
     port.poe_status = clean_optional_str(data.get("poeStatus") or data.get("poe_status"))
     port.stale = bool(data.get("stale", False))
+    mark_overrides(port, {"name", "alias", "speed_mbps", "media", "mac_address", "port_role", "vlan_summary", "poe_status"})
     return port
 
 
@@ -939,6 +1102,7 @@ async def import_cable_link(
         session.add(link)
     link.label = clean_optional_str(data.get("label"))
     link.cable_no = clean_optional_str(data.get("cableNo") or data.get("cable_no"))
+    link.vlan_id = vlan_id_or_none(data.get("vlanId") or data.get("vlan_id"))
     link.color = clean_optional_str(data.get("color")) or "#4f8cff"
     link.notes = clean_optional_str(data.get("notes"))
 
@@ -1036,6 +1200,13 @@ def float_or_none(value: object) -> float | None:
         return None
 
 
+def vlan_id_or_none(value: object) -> int | None:
+    vlan_id = int_or_none(value)
+    if vlan_id is None:
+        return None
+    return vlan_id if 1 <= vlan_id <= 4094 else None
+
+
 @router.post("/cable-links", response_model=CableLinkRead)
 async def create_cable_link(payload: CableLinkCreate, session: AsyncSession = Depends(get_session)) -> CableLink:
     a = await get_port_or_404(session, payload.endpointAPortId)
@@ -1058,6 +1229,7 @@ async def create_cable_link(payload: CableLinkCreate, session: AsyncSession = De
         endpoint_b_port_id=endpoint_b,
         label=payload.label,
         cable_no=payload.cableNo,
+        vlan_id=payload.vlanId,
         color=payload.color,
         notes=payload.notes,
         verified_at=payload.verifiedAt,
@@ -1073,7 +1245,7 @@ async def create_cable_link(payload: CableLinkCreate, session: AsyncSession = De
 async def update_cable_link(link_id: int, payload: CableLinkUpdate, session: AsyncSession = Depends(get_session)) -> CableLink:
     link = await get_link_or_404(session, link_id)
     data = payload.model_dump(exclude_unset=True)
-    field_map = {"cableNo": "cable_no", "verifiedAt": "verified_at", "createdBy": "created_by"}
+    field_map = {"cableNo": "cable_no", "vlanId": "vlan_id", "verifiedAt": "verified_at", "createdBy": "created_by"}
     for key, value in data.items():
         setattr(link, field_map.get(key, key), value)
     await session.commit()
@@ -1164,6 +1336,265 @@ async def sync_runs(
     return list(result.scalars().all())
 
 
+def _normalize_ingest_port_identity(name: str) -> str:
+    return normalize_port_name(name)
+
+
+def _normalize_patterns(patterns: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for pattern in patterns:
+        text = pattern.strip().lower()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _is_physical_ingest_port(name: str | None, strict_physical_ports: bool, patterns: list[str]) -> bool:
+    if name is None:
+        return False
+    if not strict_physical_ports:
+        return True
+    if is_virtual_port_name(name):
+        return False
+    if not patterns:
+        return True
+    normalized = name.strip().lower()
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in patterns)
+
+
+def _ingest_device_cache_keys(payload: IngestDevice, device: Device) -> list[str]:
+    keys: list[str] = [f"name:{payload.displayName.strip().lower()}"]
+    if payload.zabbixHostid:
+        keys.append(f"host:{payload.zabbixHostid.strip()}")
+    if payload.mgmtIp:
+        keys.append(f"mgmt:{payload.mgmtIp.strip()}")
+    keys.append(f"id:{device.id}")
+    return keys
+
+
+async def _find_or_create_device_for_ingest(session: AsyncSession, source: str, payload: IngestDevice) -> Device:
+    display_name = clean_required_text(payload.displayName, "Device display name is required")
+    zabbix_hostid = clean_optional_str(payload.zabbixHostid)
+    mgmt_ip = clean_optional_str(payload.mgmtIp)
+    role = payload.role
+    seen_at = _parse_iso_datetime(payload.lastSeenAt)
+
+    device: Device | None = None
+    if zabbix_hostid:
+        result = await session.execute(select(Device).where(Device.zabbix_hostid == zabbix_hostid))
+        device = result.scalar_one_or_none()
+    if device is None and mgmt_ip:
+        result = await session.execute(select(Device).where(Device.mgmt_ip == mgmt_ip))
+        device = result.scalar_one_or_none()
+    if device is None:
+        result = await session.execute(select(Device).where(Device.display_name == display_name, Device.role == role))
+        device = result.scalar_one_or_none()
+    if device is None:
+        device = Device(
+            source=source,
+            display_name=display_name,
+            role=role,
+            model=clean_optional_str(payload.model),
+            mgmt_ip=mgmt_ip,
+            zabbix_hostid=zabbix_hostid,
+            status=payload.status or "online",
+            health=payload.health or "unknown",
+            enabled=True,
+            stale=False,
+        )
+        if seen_at is not None:
+            device.last_seen_at = seen_at
+        session.add(device)
+        await session.flush()
+        return device
+
+    device.source = source
+    set_unless_overridden(device, "role", role)
+    set_unless_overridden(device, "display_name", display_name)
+    set_optional_unless_overridden(device, "model", clean_optional_str(payload.model))
+    set_optional_unless_overridden(device, "mgmt_ip", mgmt_ip)
+    if zabbix_hostid:
+        device.zabbix_hostid = zabbix_hostid
+    if payload.status:
+        device.status = payload.status
+    if payload.health:
+        device.health = payload.health
+    if payload.enabled is not None:
+        set_unless_overridden(device, "enabled", payload.enabled)
+    if seen_at is not None:
+        device.last_seen_at = seen_at
+    device.stale = False
+    if not device.status:
+        device.status = "online"
+    return device
+
+
+async def _upsert_ingest_port(
+    session: AsyncSession,
+    device_id: int,
+    source: str,
+    payload: IngestPort,
+    *,
+    strict_physical_ports: bool = False,
+) -> tuple[str | None, bool]:
+    name = clean_required_text(payload.name, "Port name is required")
+    if strict_physical_ports and is_virtual_port_name(name):
+        return None, False
+
+    identity = _normalize_ingest_port_identity(name)
+    if not identity:
+        return None, False
+    port_identity = f"manual:{identity}"
+    existing_port: Port | None = None
+    if payload.ifIndex is not None:
+        result = await session.execute(select(Port).where(Port.device_id == device_id, Port.if_index == payload.ifIndex))
+        existing_port = result.scalar_one_or_none()
+    if existing_port is None:
+        result = await session.execute(
+            select(Port).where(Port.device_id == device_id, Port.identity == port_identity),
+        )
+        existing_port = result.scalar_one_or_none()
+    if existing_port is None:
+        existing_port = await session.execute(
+            select(Port).where(Port.device_id == device_id, Port.name == name)
+        )
+        existing_port = existing_port.scalar_one_or_none()
+
+    if existing_port is None:
+        existing_port = Port(
+            device_id=device_id,
+            source=source,
+            identity=port_identity,
+            name=name,
+        )
+        session.add(existing_port)
+
+    existing_port.source = source
+    existing_port.identity = port_identity
+    existing_port.if_index = payload.ifIndex if payload.ifIndex is not None else existing_port.if_index
+    set_unless_overridden(existing_port, "name", name)
+    set_optional_unless_overridden(existing_port, "alias", clean_optional_str(payload.alias))
+    existing_port.oper_status = clean_optional_str(payload.operStatus) or existing_port.oper_status or "unknown"
+    existing_port.admin_status = clean_optional_str(payload.adminStatus) or existing_port.admin_status or "unknown"
+    if payload.speedMbps is not None:
+        set_unless_overridden(existing_port, "speed_mbps", payload.speedMbps)
+    set_optional_unless_overridden(existing_port, "media", clean_optional_str(payload.media))
+    set_optional_unless_overridden(existing_port, "mac_address", normalize_mac_address(payload.macAddress))
+    set_optional_unless_overridden(existing_port, "port_role", clean_optional_str(payload.portRole))
+    set_optional_unless_overridden(existing_port, "vlan_summary", clean_optional_str(payload.vlanSummary))
+    set_optional_unless_overridden(existing_port, "poe_status", clean_optional_str(payload.poeStatus))
+    existing_port.last_traffic_in_bps = payload.lastTrafficInBps if payload.lastTrafficInBps is not None else existing_port.last_traffic_in_bps
+    existing_port.last_traffic_out_bps = payload.lastTrafficOutBps if payload.lastTrafficOutBps is not None else existing_port.last_traffic_out_bps
+    existing_port.rx_errors = payload.rxErrors if payload.rxErrors is not None else existing_port.rx_errors
+    existing_port.tx_errors = payload.txErrors if payload.txErrors is not None else existing_port.tx_errors
+    existing_port.stale = False
+    return _normalize_ingest_port_identity(name), True
+
+
+async def _resolve_ingest_endpoint(
+    session: AsyncSession,
+    endpoint: IngestEndpointRef,
+    device_cache: dict[str, Device],
+    ports_by_device: dict[int, list[Port]],
+) -> Port | None:
+    device: Device | None = None
+    target_mac = normalize_mac_address(endpoint.macAddress)
+    if endpoint.deviceId is not None:
+        for candidate in device_cache.values():
+            if candidate.id == endpoint.deviceId:
+                device = candidate
+                break
+        if device is None:
+            device = await session.get(Device, endpoint.deviceId)
+    if device is None and endpoint.zabbixHostid:
+        device = device_cache.get(f"host:{endpoint.zabbixHostid}") or next(
+            (item for item in device_cache.values() if item.zabbix_hostid == endpoint.zabbixHostid),
+            None,
+        )
+        if device is None:
+            result = await session.execute(select(Device).where(Device.zabbix_hostid == endpoint.zabbixHostid))
+            device = result.scalar_one_or_none()
+    if device is None and endpoint.displayName:
+        key = f"name:{endpoint.displayName.strip().lower()}"
+        device = device_cache.get(key)
+        if device is None:
+            result = await session.execute(select(Device).where(Device.display_name == endpoint.displayName))
+            device = result.scalar_one_or_none()
+    if device is None and endpoint.mgmtIp:
+        result = await session.execute(select(Device).where(Device.mgmt_ip == endpoint.mgmtIp))
+        device = result.scalar_one_or_none()
+
+    if device is None:
+        if target_mac:
+            return await _resolve_unique_port_by_mac(session, target_mac)
+        return None
+
+    candidate_ports = ports_by_device.get(device.id, [])
+    if not candidate_ports:
+        result = await session.execute(select(Port).where(Port.device_id == device.id))
+        candidate_ports = list(result.scalars().all())
+    if target_mac:
+        matches = [port for port in candidate_ports if port.mac_address == target_mac and not port.stale]
+        return matches[0] if len(matches) == 1 else None
+    if endpoint.ifIndex is not None:
+        for port in candidate_ports:
+            if port.if_index == endpoint.ifIndex:
+                return port
+
+    target_name = clean_optional_str(endpoint.portName)
+    if target_name:
+        candidate_key = _normalize_ingest_port_identity(target_name)
+        for port in candidate_ports:
+            if _normalize_ingest_port_identity(port.name) == candidate_key:
+                return port
+
+    return None
+
+
+async def _resolve_unique_port_by_mac(session: AsyncSession, mac_address: str) -> Port | None:
+    result = await session.execute(select(Port).where(Port.mac_address == mac_address, Port.stale.is_(False)))
+    matches = list(result.scalars().all())
+    return matches[0] if len(matches) == 1 else None
+
+
+async def _get_or_create_link(session: AsyncSession, endpoint_a: Port, endpoint_b: Port) -> CableLink:
+    endpoint_a_id, endpoint_b_id = sorted([endpoint_a.id, endpoint_b.id])
+    result = await session.execute(
+        select(CableLink).where(
+            CableLink.endpoint_a_port_id == endpoint_a_id,
+            CableLink.endpoint_b_port_id == endpoint_b_id,
+        )
+    )
+    link = result.scalar_one_or_none()
+    if link is None:
+        link = CableLink(endpoint_a_port_id=endpoint_a_id, endpoint_b_port_id=endpoint_b_id)
+        session.add(link)
+    return link
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise HTTPException(status_code=400, detail=f"Invalid datetime: {value}")
+
+
 async def get_device_or_404(session: AsyncSession, device_id: int) -> Device:
     result = await session.execute(select(Device).where(Device.id == device_id))
     device = result.scalar_one_or_none()
@@ -1202,6 +1633,7 @@ def port_from_create(device_id: int, payload: PortCreate, *, name: str | None = 
         admin_status="unknown",
         speed_mbps=payload.speedMbps,
         media=payload.media,
+        mac_address=normalize_mac_address(payload.macAddress),
         port_role=payload.portRole,
         vlan_summary=payload.vlanSummary,
         poe_status=payload.poeStatus,
@@ -1211,37 +1643,6 @@ def port_from_create(device_id: int, payload: PortCreate, *, name: str | None = 
 
 def manual_port_identity(name: str) -> str:
     return f"manual:{name.strip().lower()}"
-
-
-def build_node(device: Device, index: int, layout: TopologyLayout | None) -> TopologyNode:
-    if layout:
-        position = {"x": layout.x, "y": layout.y}
-    elif device.role == "switch":
-        position = {"x": 80, "y": 80 + index * 260}
-    else:
-        position = {"x": 720 + (index % 3) * 300, "y": 80 + (index // 3) * 140}
-    ports = sorted(device.ports, key=lambda port: port_sort_key(port.name))
-    return TopologyNode(
-        id=f"device-{device.id}",
-        type="switchNode" if device.role == "switch" else "endpointNode",
-        position=position,
-        data={
-            "device": DeviceRead.model_validate(device).model_dump(by_alias=False),
-            "ports": [PortRead.model_validate(port).model_dump(by_alias=False) for port in ports],
-        },
-    )
-
-
-def switch_panel(device: Device) -> dict:
-    profile = profile_for_model(device.model)
-    ports = sorted(device.ports, key=lambda port: port_sort_key(port.name))
-    return {
-        "deviceId": device.id,
-        "modelKey": profile.key if profile else None,
-        "displayName": device.display_name,
-        "health": device.health,
-        "ports": [PortRead.model_validate(port).model_dump(by_alias=False) for port in ports],
-    }
 
 
 def merge_series(raw: list[dict], in_itemid: str | None, out_itemid: str | None, *, trend: bool) -> list[SeriesPoint]:

@@ -2,12 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 
+from app import routes as api_routes
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import database
 from app.db_models import Base, ZabbixSyncRun
 from app.main import app
+from app.services.mapper import DeviceSnapshot, PortSnapshot
+from app.config import Settings
+
+
+def fake_snapshot(hostid: str, port_name: str = "eth0") -> DeviceSnapshot:
+    return DeviceSnapshot(
+        zabbix_hostid=hostid,
+        role="server",
+        display_name=f"host-{hostid}",
+        model="PowerEdge",
+        ports=[PortSnapshot(identity=f"ifindex:1", name=port_name, if_index=1, oper_status="up")],
+    )
 
 
 async def test_device_and_cable_api_roundtrip():
@@ -43,12 +56,15 @@ async def test_device_and_cable_api_roundtrip():
 
         link = await client.post(
             "/api/cable-links",
-            json={"endpointAPortId": first_port, "endpointBPortId": second_port, "label": "L-001"},
+            json={"endpointAPortId": first_port, "endpointBPortId": second_port, "label": "L-001", "vlanId": 30},
         )
         assert link.status_code == 200
+        assert link.json()["vlanId"] == 30
         topology = await client.get("/api/topology")
         assert topology.status_code == 200
         assert len(topology.json()["edges"]) == 1
+        assert topology.json()["edges"][0]["data"]["vlan"] == 30
+        assert topology.json()["edges"][0]["label"] == "L-001 · VLAN 30"
 
         deleted_port = await client.delete(f"/api/ports/{second_port}")
         assert deleted_port.status_code == 200
@@ -332,5 +348,658 @@ async def test_topology_names_are_validated_before_database_constraints():
         assert second.status_code == 200
         rename_conflict = await client.patch(f"/api/topologies/{second.json()['id']}", json={"name": "机柜 A"})
         assert rename_conflict.status_code == 409
+
+    await engine.dispose()
+
+
+async def test_ports_query_supports_topology_scope_and_filters():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology_a = (await client.post("/api/topologies", json={"name": "scope-a"})).json()
+        topology_b = (await client.post("/api/topologies", json={"name": "scope-b"})).json()
+
+        switch_a = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "switch-a",
+                    "role": "switch",
+                    "topologyId": topology_a["id"],
+                    "ports": [{"name": "ge-1"}, {"name": "ge-2"}, {"name": "ge-3"}],
+                },
+            )
+        ).json()
+        server_a = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "server-a",
+                    "role": "server",
+                    "topologyId": topology_a["id"],
+                    "ports": [{"name": "eth0"}],
+                },
+            )
+        ).json()
+        _unused = (await client.post(
+            "/api/devices",
+            json={
+                "displayName": "switch-b",
+                "role": "switch",
+                "topologyId": topology_b["id"],
+                "ports": [{"name": "ge-1"}],
+            },
+        )).json()
+
+        switch_a_ports = await client.get(f"/api/devices/{switch_a['id']}/ports")
+        server_a_ports = await client.get(f"/api/devices/{server_a['id']}/ports")
+        p_a1 = switch_a_ports.json()[0]["id"]
+        p_a2 = switch_a_ports.json()[1]["id"]
+        p_a3 = switch_a_ports.json()[2]["id"]
+        p_a2_data = await client.patch(f"/api/ports/{p_a2}", json={"operStatus": "up", "stale": True})
+        assert p_a2_data.status_code == 200
+        p_a1_up = await client.patch(f"/api/ports/{p_a1}", json={"operStatus": "up"})
+        assert p_a1_up.status_code == 200
+        p_a3_down = await client.patch(f"/api/ports/{p_a3}", json={"operStatus": "down"})
+        assert p_a3_down.status_code == 200
+        await client.patch(f"/api/ports/{server_a_ports.json()[0]['id']}", json={"operStatus": "up"})
+
+        response = await client.get(f"/api/ports?topologyId={topology_a['id']}&status=up&includeStale=false")
+        assert response.status_code == 200
+        assert [port["name"] for port in response.json()] == ["ge-1", "eth0"]
+
+        response = await client.get(f"/api/ports?topologyId={topology_a['id']}&status=stale")
+        assert response.status_code == 200
+        assert [port["name"] for port in response.json()] == ["ge-2"]
+
+        response = await client.get(f"/api/ports?topologyId={topology_a['id']}&status=up&includeStale=false&limit=1&offset=1")
+        assert response.status_code == 200
+        assert len(response.json()) == 1
+        assert response.json()[0]["name"] == "eth0"
+
+        response = await client.get("/api/ports?includeStale=false")
+        assert response.status_code == 200
+        assert len(response.json()) == 4
+
+    await engine.dispose()
+
+
+async def test_topology_layout_viewport_roundtrip():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "layout-topology"})).json()
+        device = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "switch-layout",
+                    "role": "switch",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "ge-1"}],
+                },
+            )
+        ).json()
+
+        graph = await client.get(f"/api/topology?topologyId={topology['id']}")
+        node_id = graph.json()["nodes"][0]["id"]
+        payload = await client.patch(
+            "/api/topology/layout",
+            json={"layoutKey": f"topology:{topology['id']}", "nodes": [{"nodeId": node_id, "x": 120, "y": 250}], "viewport": {"x": 10, "y": 20, "zoom": 1.2}},
+        )
+        assert payload.status_code == 200
+
+        restored = (await client.get(f"/api/topology?topologyId={topology['id']}")).json()
+        assert restored["layout"]["viewport"] == {"x": 10.0, "y": 20.0, "zoom": 1.2}
+        restored_node = next(item for item in restored["layout"]["nodes"] if item["nodeId"] == node_id)
+        assert restored_node["x"] == 120
+        assert restored_node["y"] == 250
+
+        assert restored["nodes"][0]["position"]["x"] == 120
+        assert restored["nodes"][0]["position"]["y"] == 250
+
+    await engine.dispose()
+
+
+async def test_cable_link_patch_and_delete_flow():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topo = (await client.post("/api/topologies", json={"name": "link-edit"})).json()
+        left = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "switch-left",
+                    "role": "switch",
+                    "topologyId": topo["id"],
+                    "ports": [{"name": "ge-1"}],
+                },
+            )
+        ).json()
+        right = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "server-right",
+                    "role": "server",
+                    "topologyId": topo["id"],
+                    "ports": [{"name": "eth0"}],
+                },
+            )
+        ).json()
+
+        left_port = (await client.get(f"/api/devices/{left['id']}/ports")).json()[0]
+        right_port = (await client.get(f"/api/devices/{right['id']}/ports")).json()[0]
+        link = (
+            await client.post(
+                "/api/cable-links",
+                json={"endpointAPortId": left_port["id"], "endpointBPortId": right_port["id"], "label": "A-01", "cableNo": "C-01"},
+            )
+        ).json()
+        patch = await client.patch(
+            f"/api/cable-links/{link['id']}",
+            json={"cableNo": "C-02", "label": "A-02", "notes": "updated"},
+        )
+        assert patch.status_code == 200
+        assert patch.json()["cableNo"] == "C-02"
+        assert patch.json()["label"] == "A-02"
+        assert patch.json()["notes"] == "updated"
+
+        delete = await client.delete(f"/api/cable-links/{link['id']}")
+        assert delete.status_code == 200
+
+        topology_after = (await client.get(f"/api/topology?topologyId={topo['id']}")).json()
+        assert topology_after["cableLinks"] == []
+        assert topology_after["edges"] == []
+
+    await engine.dispose()
+
+
+async def test_sync_and_import_uses_snapshot_sync_once(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async def fake_collect(_zabbix, _settings):
+        counters["collect"] += 1
+        return [
+            fake_snapshot("snap-101", "ge-1"),
+            fake_snapshot("snap-102", "ge-2"),
+        ]
+
+    original_sync_from_snapshots = api_routes.run_zabbix_sync_from_snapshots
+    counters = {"collect": 0, "from_snapshots": 0}
+
+    async def fake_collect_snapshots(_session, _settings, snapshots):
+        counters["from_snapshots"] += 1
+        return await original_sync_from_snapshots(_session, _settings, snapshots)
+
+    def forbidden_full_sync(*_args, **_kwargs):
+        raise AssertionError("run_zabbix_sync should not be called by sync-and-import")
+
+    monkeypatch.setattr(api_routes, "collect_zabbix_snapshots", fake_collect)
+    monkeypatch.setattr(api_routes, "run_zabbix_sync", forbidden_full_sync)
+    monkeypatch.setattr(api_routes, "run_zabbix_sync_from_snapshots", fake_collect_snapshots)
+    monkeypatch.setattr(api_routes, "get_settings", lambda: Settings(environment="test", zabbix_user="admin", zabbix_password="pwd"))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "sync-once"})).json()
+        response = await client.post(f"/api/topologies/{topology['id']}/sync-and-import", json={"hostids": ["snap-101"]})
+        assert response.status_code == 200
+        assert response.json()["deviceCount"] == 1
+
+        ports = (await client.get(f"/api/ports?topologyId={topology['id']}")).json()
+        assert len(ports) == 1
+        assert any(port["name"] == "ge-1" for port in ports)
+        assert counters["from_snapshots"] == 1
+
+        # verify helper path was not used
+        counter_value = counters["collect"]
+        assert counter_value == 1
+
+    await engine.dispose()
+
+
+async def test_sync_push_payload_supports_strict_physical_filter():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "push-topo"})).json()
+
+        strict_response = await client.post(
+            "/api/sync/push",
+            json={
+                "source": "agent",
+                "strictPhysicalPorts": True,
+                "topologyId": topology["id"],
+                "devices": [
+                    {
+                        "displayName": "core-switch",
+                        "role": "switch",
+                        "ports": [
+                            {"name": "vWAN2001"},
+                            {"name": "XGE0/1"},
+                        ],
+                    },
+                ],
+                "cables": [],
+            },
+        )
+        assert strict_response.status_code == 200
+        strict_body = strict_response.json()
+        assert strict_body["devices"] == 1
+        assert strict_body["ports"] == 1
+
+        loose_response = await client.post(
+            "/api/sync/push",
+            json={
+                "source": "agent",
+                "strictPhysicalPorts": False,
+                "topologyId": topology["id"],
+                "devices": [
+                    {
+                        "displayName": "core-switch",
+                        "role": "switch",
+                        "ports": [
+                            {"name": "vWAN2001"},
+                            {"name": "XGE0/1"},
+                        ],
+                    },
+                ],
+                "cables": [],
+            },
+        )
+        assert loose_response.status_code == 200
+        loose_body = loose_response.json()
+        assert loose_body["devices"] == 1
+        assert loose_body["ports"] == 2
+
+        devices = (await client.get("/api/devices")).json()
+        core_switch = next(item for item in devices if item["displayName"] == "core-switch")
+        ports = (await client.get(f"/api/ports?deviceId={core_switch['id']}&includeVirtual=true")).json()
+        assert {item["name"] for item in ports} == {"vWAN2001", "XGE0/1"}
+
+    await engine.dispose()
+
+
+async def test_command_push_can_update_existing_cables_without_devices_payload():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "command-cables"})).json()
+        server = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "compute-01",
+                    "role": "server",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "ens1f0"}],
+                },
+            )
+        ).json()
+        switch = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "tor-01",
+                    "role": "switch",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "XGE0/1"}],
+                },
+            )
+        ).json()
+
+        pushed = await client.post(
+            "/api/sync/command-push",
+            json={
+                "source": "command",
+                "topologyId": topology["id"],
+                "strictPhysicalPorts": True,
+                "devices": [],
+                "cables": [
+                    {
+                        "endpointA": {"deviceId": server["id"], "portName": "ens1f0"},
+                        "endpointB": {"displayName": "tor-01", "portName": "XGE0/1"},
+                        "label": "compute-01 uplink",
+                        "cableNo": "CAB-1001",
+                        "vlanId": 88,
+                    }
+                ],
+            },
+        )
+
+        assert pushed.status_code == 200
+        assert pushed.json()["devices"] == 0
+        assert pushed.json()["ports"] == 0
+        assert pushed.json()["cables"] == 1
+
+        graph = (await client.get(f"/api/topology?topologyId={topology['id']}")).json()
+        assert len(graph["cableLinks"]) == 1
+        assert len(graph["edges"]) == 1
+        assert graph["cableLinks"][0]["label"] == "compute-01 uplink"
+        assert graph["cableLinks"][0]["cableNo"] == "CAB-1001"
+        assert graph["cableLinks"][0]["vlanId"] == 88
+        assert graph["edges"][0]["data"]["vlan"] == 88
+        assert {device["displayName"] for device in graph["devices"]} == {"compute-01", "tor-01"}
+        assert switch["id"] != server["id"]
+
+    await engine.dispose()
+
+
+async def test_command_push_can_resolve_cable_endpoint_by_mac_address():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "mac-learned"})).json()
+        server = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "compute-mac",
+                    "role": "server",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "ens1f0", "macAddress": "52-54-00-AA-BB-CC"}],
+                },
+            )
+        ).json()
+        switch = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "tor-mac",
+                    "role": "switch",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "XGE0/2"}],
+                },
+            )
+        ).json()
+        server_ports = (await client.get(f"/api/devices/{server['id']}/ports")).json()
+        switch_ports = (await client.get(f"/api/devices/{switch['id']}/ports")).json()
+        assert server_ports[0]["macAddress"] == "52:54:00:aa:bb:cc"
+
+        pushed = await client.post(
+            "/api/sync/command-push",
+            json={
+                "source": "command",
+                "topologyId": topology["id"],
+                "devices": [],
+                "cables": [
+                    {
+                        "endpointA": {"displayName": "tor-mac", "portName": "XGE0/2"},
+                        "endpointB": {"macAddress": "5254.00aa.bbcc"},
+                        "label": "learned-from-mac",
+                        "vlanId": 77,
+                    }
+                ],
+            },
+        )
+
+        assert pushed.status_code == 200
+        assert pushed.json()["cables"] == 1
+
+        graph = (await client.get(f"/api/topology?topologyId={topology['id']}")).json()
+        link = graph["cableLinks"][0]
+        assert {link["endpointAPortId"], link["endpointBPortId"]} == {server_ports[0]["id"], switch_ports[0]["id"]}
+        assert link["vlanId"] == 77
+        assert graph["edges"][0]["data"]["vlan"] == 77
+
+    await engine.dispose()
+
+
+async def test_topology_edges_use_vlan_colors():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "vlan-color"})).json()
+        switch = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "vlan-switch",
+                    "role": "switch",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "ge-1", "vlanSummary": "trunk 10,20"}],
+                },
+            )
+        ).json()
+        server = (
+            await client.post(
+                "/api/devices",
+                json={
+                    "displayName": "vlan-server",
+                    "role": "server",
+                    "topologyId": topology["id"],
+                    "ports": [{"name": "eth0", "vlanSummary": "PVID 20"}],
+                },
+            )
+        ).json()
+        switch_port = (await client.get(f"/api/devices/{switch['id']}/ports")).json()[0]
+        server_port = (await client.get(f"/api/devices/{server['id']}/ports")).json()[0]
+        await client.post(
+            "/api/cable-links",
+            json={
+                "endpointAPortId": switch_port["id"],
+                "endpointBPortId": server_port["id"],
+                "color": "#3274d9",
+            },
+        )
+
+        graph = (await client.get(f"/api/topology?topologyId={topology['id']}")).json()
+        assert graph["edges"][0]["data"]["vlan"] == 20
+        assert graph["edges"][0]["style"]["stroke"] != "#3274d9"
+
+    await engine.dispose()
+
+
+async def test_ip_addr_push_parses_server_physical_ports():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    ip_addr_output = """
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN qdisc noqueue
+    inet 127.0.0.1/8 scope host lo
+2: ens18: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP qdisc mq
+    link/ether 52:54:00:10:20:30 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.10.21/24 brd 192.168.10.255 scope global ens18
+3: eno1: <BROADCAST,MULTICAST> mtu 1500 state DOWN qdisc noop
+    link/ether 52:54:00:10:20:31 brd ff:ff:ff:ff:ff:ff
+4: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 state DOWN qdisc noqueue
+    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+"""
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/api/topologies", json={"name": "ip-addr-topo", "isDefault": True})).json()
+        response = await client.post(
+            "/api/sync/ip-addr",
+            json={
+                "displayName": "compute-ipaddr",
+                "mgmtIp": "192.168.10.21",
+                "output": ip_addr_output,
+                "topologyId": topology["id"],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["devices"] == 1
+        assert response.json()["ports"] == 2
+
+        graph = (await client.get(f"/api/topology?topologyId={topology['id']}")).json()
+        device = next(item for item in graph["devices"] if item["displayName"] == "compute-ipaddr")
+        ports = (await client.get(f"/api/devices/{device['id']}/ports")).json()
+        assert {port["name"] for port in ports} == {"ens18", "eno1"}
+        ens18 = next(port for port in ports if port["name"] == "ens18")
+        assert ens18["operStatus"] == "up"
+        assert ens18["alias"] == "192.168.10.21/24"
+        assert ens18["macAddress"] == "52:54:00:10:20:30"
+        assert all(port["name"] != "docker0" for port in ports)
+
+    await engine.dispose()
+
+
+async def test_network_prefixed_ip_addr_push_uses_api_router():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        topology = (await client.post("/network/api/topologies", json={"name": "network-prefix", "isDefault": True})).json()
+        response = await client.post(
+            "/network/api/sync/ip-addr",
+            json={
+                "displayName": "prefixed-compute",
+                "output": "2: ens19: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n    inet 10.0.0.19/24 scope global ens19\n",
+                "topologyId": topology["id"],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["devices"] == 1
+        assert response.json()["ports"] == 1
+        graph = (await client.get(f"/network/api/topology?topologyId={topology['id']}")).json()
+        assert {device["displayName"] for device in graph["devices"]} == {"prefixed-compute"}
+
+    await engine.dispose()
+
+
+async def test_manual_device_and_port_config_survives_zabbix_sync():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database.engine = engine
+    database.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.zabbix = object()
+
+    first_snapshot = DeviceSnapshot(
+        zabbix_hostid="override-1",
+        role="server",
+        display_name="zabbix-name",
+        model="PowerEdge",
+        mgmt_ip="10.20.30.40",
+        status="online",
+        health="ok",
+        ports=[
+            PortSnapshot(
+                identity="ifindex:1",
+                if_index=1,
+                name="ens18",
+                alias="from zabbix",
+                oper_status="up",
+                admin_status="up",
+                speed_mbps=1000,
+                media="ethernet",
+                port_role="uplink",
+                vlan_summary="PVID 20",
+            )
+        ],
+    )
+    second_snapshot = DeviceSnapshot(
+        zabbix_hostid="override-1",
+        role="server",
+        display_name="zabbix-renamed",
+        model="NewModel",
+        mgmt_ip="10.20.30.41",
+        status="online",
+        health="warning",
+        ports=[
+            PortSnapshot(
+                identity="ifindex:1",
+                if_index=1,
+                name="ens19",
+                alias="from zabbix again",
+                oper_status="down",
+                admin_status="up",
+                speed_mbps=25000,
+                media="fiber",
+                port_role="server",
+                vlan_summary="PVID 30",
+            )
+        ],
+    )
+
+    async with database.SessionLocal() as session:
+        await api_routes.run_zabbix_sync_from_snapshots(session, Settings(environment="test"), [first_snapshot])
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        devices = (await client.get("/api/devices")).json()
+        device = next(item for item in devices if item["zabbixHostid"] == "override-1")
+        ports = (await client.get(f"/api/devices/{device['id']}/ports")).json()
+        port = ports[0]
+
+        device_patch = await client.patch(
+            f"/api/devices/{device['id']}",
+            json={"displayName": "manual-name", "model": "ManualModel", "mgmtIp": "10.20.30.99"},
+        )
+        assert device_patch.status_code == 200
+        port_patch = await client.patch(
+            f"/api/ports/{port['id']}",
+            json={"name": "uplink0", "alias": "manual alias", "speedMbps": 10000, "media": "dac", "portRole": "storage", "vlanSummary": "PVID 88"},
+        )
+        assert port_patch.status_code == 200
+
+    async with database.SessionLocal() as session:
+        await api_routes.run_zabbix_sync_from_snapshots(session, Settings(environment="test"), [second_snapshot])
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        refreshed_device = next(item for item in (await client.get("/api/devices")).json() if item["zabbixHostid"] == "override-1")
+        refreshed_ports = (await client.get(f"/api/devices/{refreshed_device['id']}/ports")).json()
+        refreshed_port = refreshed_ports[0]
+
+        assert refreshed_device["displayName"] == "manual-name"
+        assert refreshed_device["model"] == "ManualModel"
+        assert refreshed_device["mgmtIp"] == "10.20.30.99"
+        assert refreshed_device["health"] == "warning"
+        assert refreshed_port["name"] == "uplink0"
+        assert refreshed_port["alias"] == "manual alias"
+        assert refreshed_port["speedMbps"] == 10000
+        assert refreshed_port["media"] == "dac"
+        assert refreshed_port["portRole"] == "storage"
+        assert refreshed_port["vlanSummary"] == "PVID 88"
+        assert refreshed_port["operStatus"] == "down"
 
     await engine.dispose()

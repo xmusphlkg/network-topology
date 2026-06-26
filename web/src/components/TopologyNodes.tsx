@@ -1,4 +1,5 @@
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
+import { useEffect, type MouseEvent } from 'react';
 import { Box, Network, Server } from 'lucide-react';
 import type { Device, Port } from '../types';
 import { PortMatrix } from './PortMatrix';
@@ -8,12 +9,20 @@ type NodeData = {
   device: Device;
   ports: Port[];
   selectedPortId?: number | null;
+  candidatePortId?: number | null;
   highlighted?: boolean;
-  onPortClick?: (port: Port) => void;
+  onPortClick?: (port: Port, event?: MouseEvent<HTMLButtonElement>) => void;
+  portLayoutColumns?: number | null;
+  portLayoutRows?: 1 | 2;
+  portLayoutArrangement?: 'sequential' | 'odd-even' | 'server';
+  hideVirtualPorts?: boolean;
+  compact?: boolean;
+  linkedPortIds?: readonly number[];
 };
 
-export function SwitchNode({ data }: NodeProps & { data: NodeData }) {
+export function SwitchNode({ id, data }: NodeProps & { data: NodeData }) {
   const ports = data.ports || [];
+  useRefreshPortHandles(String(id), data);
   const upPorts = ports.filter((port) => port.operStatus === 'up').length;
   return (
     <div className={`topology-node switch-node ${data.highlighted ? 'highlighted-node' : ''}`}>
@@ -29,22 +38,27 @@ export function SwitchNode({ data }: NodeProps & { data: NodeData }) {
         <span>{data.device.mgmtIp || '-'}</span>
         <span>{upPorts}/{ports.length} up</span>
       </div>
-      <PortMatrix ports={ports} selectedPortId={data.selectedPortId} onSelect={data.onPortClick} compact />
-      {ports.map((port, index) => (
-        <Handle
-          key={port.id}
-          id={`port-${port.id}`}
-          type="source"
-          position={Position.Right}
-          style={{ top: 54 + (index % Math.max(ports.length, 1)) * 2, opacity: 0 }}
-        />
-      ))}
+      <PortMatrix
+        ports={ports}
+        selectedPortId={data.selectedPortId}
+        candidatePortId={data.candidatePortId}
+        onSelect={data.onPortClick}
+        compact={data.compact}
+        columns={data.portLayoutColumns}
+        rows={data.portLayoutRows}
+        arrangement={data.portLayoutArrangement}
+        hideVirtual={data.hideVirtualPorts}
+        labelMode="number"
+        flowHandles
+        linkedPortIds={data.linkedPortIds}
+      />
     </div>
   );
 }
 
-export function EndpointNode({ data }: NodeProps & { data: NodeData }) {
+export function EndpointNode({ id, data }: NodeProps & { data: NodeData }) {
   const ports = data.ports || [];
+  useRefreshPortHandles(String(id), data);
   const Icon = data.device.role === 'server' ? Server : Box;
   const upPorts = ports.filter((port) => port.operStatus === 'up').length;
   return (
@@ -61,29 +75,41 @@ export function EndpointNode({ data }: NodeProps & { data: NodeData }) {
         <span>{data.device.mgmtIp || '-'}</span>
         <span>{upPorts}/{ports.length} up</span>
       </div>
-      <div className="endpoint-ports">
-        {ports.map((port) => (
-          <button
-            key={port.id}
-            className={`endpoint-port ${port.operStatus === 'up' ? 'up' : ''} ${data.selectedPortId === port.id ? 'selected' : ''}`}
-            onClick={() => data.onPortClick?.(port)}
-            title={[port.name, port.vlanSummary ? `VLAN ${port.vlanSummary}` : '', port.alias || ''].filter(Boolean).join(' · ')}
-          >
-            {port.name}
-          </button>
-        ))}
-      </div>
-      {ports.map((port, index) => (
-        <Handle
-          key={port.id}
-          id={`port-${port.id}`}
-          type="target"
-          position={Position.Left}
-          style={{ top: 52 + index * 22, opacity: 0 }}
-        />
-      ))}
+      <PortMatrix
+        ports={ports}
+        selectedPortId={data.selectedPortId}
+        candidatePortId={data.candidatePortId}
+        onSelect={data.onPortClick}
+        compact
+        columns={data.portLayoutColumns}
+        rows={data.portLayoutRows}
+        arrangement={data.portLayoutArrangement}
+        hideVirtual={data.hideVirtualPorts ?? true}
+        labelMode={data.device.role === 'server' ? 'name' : 'number'}
+        flowHandles
+        linkedPortIds={data.linkedPortIds}
+      />
     </div>
   );
+}
+
+function useRefreshPortHandles(nodeId: string, data: NodeData) {
+  const updateNodeInternals = useUpdateNodeInternals();
+  const ports = data.ports || [];
+  const signature = [
+    ports.map((port) => port.id).join(','),
+    data.portLayoutColumns ?? '',
+    data.portLayoutRows ?? '',
+    data.portLayoutArrangement ?? '',
+    data.hideVirtualPorts ?? '',
+    data.compact ?? '',
+    data.linkedPortIds?.join(',') ?? '',
+  ].join('|');
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => updateNodeInternals(nodeId));
+    return () => window.cancelAnimationFrame(frame);
+  }, [nodeId, signature, updateNodeInternals]);
 }
 
 function deviceSubtitle(device: Device) {

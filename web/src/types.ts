@@ -29,6 +29,7 @@ export interface Port {
   adminStatus: string;
   speedMbps?: number | null;
   media?: string | null;
+  macAddress?: string | null;
   portRole?: string | null;
   vlanSummary?: string | null;
   poeStatus?: string | null;
@@ -47,6 +48,7 @@ export interface CableLink {
   endpointBPortId: number;
   label?: string | null;
   cableNo?: string | null;
+  vlanId?: number | null;
   color?: string | null;
   notes?: string | null;
   verifiedAt?: string | null;
@@ -110,6 +112,102 @@ export interface TopologySummary {
   deviceCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DeviceProfilePort {
+  name: string;
+  media: string;
+  speedMbps: number | null;
+  role: string;
+  row: number;
+  order: number;
+}
+
+export interface DeviceProfile {
+  key: string;
+  models: string[];
+  portCount: number;
+  ports: DeviceProfilePort[];
+}
+
+export interface IngestPortPayload {
+  name: string;
+  ifIndex?: number | null;
+  alias?: string | null;
+  operStatus?: string | null;
+  adminStatus?: string | null;
+  speedMbps?: number | null;
+  media?: string | null;
+  macAddress?: string | null;
+  portRole?: string | null;
+  vlanSummary?: string | null;
+  poeStatus?: string | null;
+  lastTrafficInBps?: number | null;
+  lastTrafficOutBps?: number | null;
+  rxErrors?: number | null;
+  txErrors?: number | null;
+}
+
+export interface IngestEndpointPayload {
+  deviceId?: number | null;
+  zabbixHostid?: string | null;
+  mgmtIp?: string | null;
+  displayName?: string | null;
+  portName?: string | null;
+  ifIndex?: number | null;
+  macAddress?: string | null;
+}
+
+export interface IngestCablePayload {
+  endpointA: IngestEndpointPayload;
+  endpointB: IngestEndpointPayload;
+  cableNo?: string | null;
+  label?: string | null;
+  vlanId?: number | null;
+  notes?: string | null;
+  color?: string | null;
+  verifiedAt?: string | null;
+}
+
+export interface IngestDevicePayload {
+  displayName: string;
+  role: 'switch' | 'server' | 'custom' | string;
+  mgmtIp?: string | null;
+  zabbixHostid?: string | null;
+  model?: string | null;
+  status?: string | null;
+  health?: string | null;
+  lastSeenAt?: string | null;
+  source?: string;
+  enabled?: boolean;
+  strictPhysicalPorts?: boolean;
+  ports: IngestPortPayload[];
+}
+
+export interface IngestPayload {
+  source?: string;
+  topologyId?: number | null;
+  strictPhysicalPorts?: boolean;
+  physicalPortNamePatterns?: string[];
+  maxPhysicalPortsPerDevice?: number | null;
+  devices: IngestDevicePayload[];
+  cables: IngestCablePayload[];
+}
+
+export interface IngestResult {
+  devices: number;
+  ports: number;
+  cables: number;
+}
+
+export interface IpAddrIngestPayload {
+  displayName: string;
+  output: string;
+  topologyId?: number | null;
+  mgmtIp?: string | null;
+  source?: string;
+  strictPhysicalPorts?: boolean;
+  physicalPortNamePatterns?: string[];
 }
 
 export interface ZabbixDiscoveredDevice {

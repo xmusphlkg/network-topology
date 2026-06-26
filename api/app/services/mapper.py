@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..config import Settings
+from .mac import normalize_mac_address
 from .profiles import profile_for_model, port_sort_key
 
 
@@ -19,6 +20,7 @@ class PortSnapshot:
     admin_status: str = "unknown"
     speed_mbps: float | None = None
     media: str | None = None
+    mac_address: str | None = None
     port_role: str | None = None
     vlan_summary: str | None = None
     poe_status: str | None = None
@@ -30,6 +32,7 @@ class PortSnapshot:
     traffic_out_itemid: str | None = None
     oper_itemid: str | None = None
     last_seen_at: datetime | None = None
+    virtual: bool = False
 
 
 @dataclass
@@ -160,12 +163,16 @@ def parse_ports(items: list[dict[str, Any]]) -> list[PortSnapshot]:
         name_from_value = interface_name_value(value) if is_name_item(text, value) else None
         name_from_key = clean_port_name_from_key(key)
         name = name_from_value or name_from_key
+        if is_virtual_port_name(name or value or key):
+            continue
         identity = f"ifindex:{index}" if index is not None else f"name:{normalize_port_name(name or value or key)}"
+        port_virtual = is_virtual_port_name(name or "")
         port = builders.get(identity)
         if port is None:
             port = PortSnapshot(
                 identity=identity,
                 name=name or (f"ifIndex {index}" if index is not None else compact(value or key, 60)),
+                virtual=port_virtual,
                 if_index=index,
             )
             builders[identity] = port
@@ -178,7 +185,11 @@ def parse_ports(items: list[dict[str, Any]]) -> list[PortSnapshot]:
             pending_name_items.append((identity, name_from_value))
 
     for identity, name in pending_name_items:
+        if is_virtual_port_name(name):
+            builders.pop(identity, None)
+            continue
         builders[identity].name = name
+        builders[identity].virtual = False
 
     ports = [port for port in builders.values() if is_real_port(port)]
     for port in ports:
@@ -200,6 +211,7 @@ def apply_item_to_port(port: PortSnapshot, item: dict[str, Any]) -> None:
         name = clean_port_name(raw)
         if name:
             port.name = name
+            port.virtual = is_virtual_port_name(name)
         return
     if "ifalias" in text or "alias" in text or "description" in text or "接口描述" in text:
         if raw and not raw.isdigit():
@@ -238,6 +250,9 @@ def apply_item_to_port(port: PortSnapshot, item: dict[str, Any]) -> None:
     if "iftype" in text or "port type" in text or "端口类型" in text:
         if raw and not raw.isdigit():
             port.media = compact(raw, 80)
+        return
+    if is_mac_item(text):
+        port.mac_address = normalize_mac_address(raw)
 
 
 def looks_like_interface_item(text: str, value: str) -> bool:
@@ -250,6 +265,12 @@ def looks_like_interface_item(text: str, value: str) -> bool:
         "ifadminstatus",
         "ifspeed",
         "ifhighspeed",
+        "ifphysaddress",
+        "physaddress",
+        "mac",
+        "physical address",
+        "硬件地址",
+        "物理地址",
         "ifhcin",
         "ifhcout",
         "ifinerrors",
@@ -294,6 +315,10 @@ def is_out_traffic_item(text: str) -> bool:
 
 def is_vlan_item(text: str) -> bool:
     return any(token in text for token in ["vlan", "pvid", "dot1q", "tagged", "untagged", "trunk"])
+
+
+def is_mac_item(text: str) -> bool:
+    return any(token in text for token in ["ifphysaddress", "physaddress", "mac address", "physical address", "硬件地址", "物理地址"])
 
 
 def extract_if_index(key: str) -> int | None:
@@ -421,12 +446,22 @@ def infer_port_role(name: str) -> str:
 
 
 def is_real_port(port: PortSnapshot) -> bool:
-    return bool(clean_port_name(port.name) or port.if_index is not None) and not is_virtual_port_name(port.name)
+    if port.virtual:
+        return False
+    return bool(clean_port_name(port.name) or port.if_index is not None)
 
 
 def is_virtual_port_name(name: str) -> bool:
     text = name.strip().lower()
-    return bool(re.match(r"^(vwan|vlan|lo|docker|veth|virbr|tun|tap|wg|br)(?:\d|[._:-]|$)", text))
+    return bool(
+        re.match(
+            r"^(vlan|vwan)\d*[./:\-]?\w*|^(loopback|lo|docker|veth|virbr|tun|tap|wg|br\d*|bridge\d*)\b|^v\w{0,2}lan\d*[./:.-]?\w*$",
+            text,
+        )
+        or re.match(r"^\w*?(vlan|vwan)\d*[./-]", text)
+        or re.search(r"(?:^|[^a-z0-9])(vlan|vwan|vxlan)\d*[a-z0-9_.:@-]*", text)
+        or re.search(r"(?:^|[^a-z0-9])interface\s+(vlan|vwan|vxlan)\d*", text)
+    )
 
 
 def device_health_from_ports(ports: list[PortSnapshot]) -> str:
