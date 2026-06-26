@@ -16,7 +16,7 @@ def init_database(settings: Settings) -> async_sessionmaker[AsyncSession]:
     url = settings.sqlalchemy_url()
     engine_kwargs: dict[str, object] = {
         "echo": settings.db_echo,
-        "pool_pre_ping": True,
+        "pool_pre_ping": not url.startswith("mysql+aiomysql://"),
     }
     if url.startswith("mysql+aiomysql://"):
         engine_kwargs["pool_recycle"] = 1800
