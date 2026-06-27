@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { Cable, GitBranch, Network, RefreshCw, Search, Server } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from './lib/api';
@@ -112,7 +112,7 @@ function AppShell() {
         </header>
         <main className="top-main">
           <Routes>
-            <Route path="/" element={<Navigate to="/topology" replace />} />
+            <Route path="/" element={<TopologyPage />} />
             <Route path="/topology" element={<TopologyPage />} />
             <Route path="/devices/:id" element={<DeviceDetailPage />} />
             <Route path="/ports" element={<PortsPage />} />

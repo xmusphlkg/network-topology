@@ -85,7 +85,7 @@ pytest -q
 
 ## 生产部署到 192.168.3.222（Docker 镜像推送）
 
-生产环境推荐仍用单服务 compose（`docker-compose.yml`）+ `/network` 前缀：
+生产环境推荐仍用单服务 compose（`docker-compose.yml`），拓扑页入口为 `/topology`：
 
 ```bash
 cp .env.example .env
@@ -112,26 +112,21 @@ NODE_IMAGE=node:18-alpine
 生产访问路径建议设为：
 
 ```env
-PUBLIC_BASE_URL=http://192.168.3.222/network
-VITE_BASE_PATH=/network/
-VITE_API_BASE=/network
+PUBLIC_BASE_URL=http://192.168.3.222
+VITE_BASE_PATH=/
+VITE_API_BASE=
 ```
 
 若目标机前置了 nginx，可使用：
 
 ```nginx
-location = /network {
-    return 301 /network/;
-}
-
-location /network/ {
-    proxy_pass http://127.0.0.1:8091/;
+location / {
+    proxy_pass http://127.0.0.1:8091;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Prefix /network;
 }
 ```
 

@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Switch Topology"
     environment: Literal["dev", "prod", "test"] = "prod"
-    public_base_url: str = "http://192.168.3.222/network"
+    public_base_url: str = "http://192.168.3.222"
 
     database_url: str | None = None
     mysql_host: str = "127.0.0.1"
