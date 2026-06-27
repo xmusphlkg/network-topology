@@ -243,6 +243,35 @@ def test_generic_vendor_interface_names_are_supported():
     assert {port.name for port in snapshots[0].ports} == {expected for *_, expected in values}
 
 
+def test_current_zabbix_agent_net_if_items_can_use_port_name_in_key():
+    settings = Settings(environment="test", switch_group_terms="switch", server_group_terms="server")
+    hosts = [
+        {
+            "hostid": "701",
+            "host": "linux-01",
+            "name": "linux-01",
+            "hostgroups": [{"name": "server"}],
+            "interfaces": [{"ip": "192.168.20.71"}],
+            "inventory": {"model": "Ubuntu 24.04"},
+        }
+    ]
+    items = [
+        item("701", "1", "Interface ens1f0: Status", 'net.if.operstatus["ens1f0"]', "1"),
+        item("701", "2", "Interface ens1f0: Speed", 'net.if.speed["ens1f0"]', "10000000000"),
+        item("701", "3", "Interface ens1f0: Bits received", 'net.if.in["ens1f0"]', "1234"),
+        item("701", "4", "Interface ens1f0: Bits sent", 'net.if.out["ens1f0"]', "5678"),
+    ]
+
+    snapshots = map_zabbix_inventory(hosts, items, settings)
+
+    assert snapshots[0].role == "server"
+    assert snapshots[0].ports[0].name == "ens1f0"
+    assert snapshots[0].ports[0].oper_status == "up"
+    assert snapshots[0].ports[0].speed_mbps == 10000
+    assert snapshots[0].ports[0].last_traffic_in_bps == 1234
+    assert snapshots[0].ports[0].last_traffic_out_bps == 5678
+
+
 def item(hostid: str, itemid: str, name: str, key: str, value: str) -> dict:
     return {
         "hostid": hostid,

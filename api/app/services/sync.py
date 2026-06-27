@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone
 
@@ -10,7 +11,7 @@ from ..clients.zabbix import ZabbixClient
 from ..config import Settings
 from ..db_models import Device, Port, ZabbixSyncRun
 from .manual_overrides import set_optional_unless_overridden, set_unless_overridden
-from .mapper import DeviceSnapshot, PortSnapshot, map_zabbix_inventory, normalize_port_name
+from .mapper import DeviceSnapshot, PortSnapshot, is_virtual_port_name, map_zabbix_inventory, normalize_port_name
 from .profiles import profile_for_model
 
 
@@ -43,6 +44,15 @@ async def run_zabbix_sync_from_snapshots(
         run.devices_upserted = upserted_devices_count
         run.ports_upserted = upserted_ports
         run.stale_devices = stale_devices
+        run.details_json = json.dumps(
+            {
+                "hostids": sorted(seen_hostids),
+                "snapshotPortCount": sum(len(snapshot.ports) for snapshot in snapshots),
+                "staleDevices": stale_devices,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         await session.commit()
         await session.refresh(run)
         return run
@@ -54,6 +64,7 @@ async def run_zabbix_sync_from_snapshots(
             finished_at=datetime.now(timezone.utc),
             duration_ms=(time.perf_counter() - started) * 1000,
             error_message=str(exc),
+            details_json=json.dumps({"errorType": type(exc).__name__}, separators=(",", ":")),
         )
         session.add(run)
         await session.commit()
@@ -123,6 +134,7 @@ async def upsert_port(session: AsyncSession, device: Device, snapshot: PortSnaps
     port.identity = snapshot.identity
     port.if_index = snapshot.if_index
     set_unless_overridden(port, "name", snapshot.name)
+    port.virtual = snapshot.virtual or is_virtual_port_name(snapshot.name)
     set_unless_overridden(port, "alias", snapshot.alias)
     port.oper_status = snapshot.oper_status
     port.admin_status = snapshot.admin_status
@@ -171,6 +183,7 @@ async def ensure_profile_ports(session: AsyncSession, device: Device) -> int:
                 source="profile",
                 identity=f"profile:{normalize_port_name(profile_port.name)}",
                 name=profile_port.name,
+                virtual=False,
                 oper_status="unknown",
                 admin_status="unknown",
                 speed_mbps=profile_port.speed_mbps,

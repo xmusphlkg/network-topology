@@ -2,8 +2,12 @@ import type {
   CableLink,
   Device,
   DeviceProfile,
+  AuditLog,
+  ImportDryRun,
   Port,
+  PortPage,
   PortSeries,
+  QualityIssue,
   SyncRun,
   SyncStatus,
   TopologyGraph,
@@ -90,6 +94,8 @@ type PortQueryParams = {
   status?: string;
   includeStale?: boolean;
   includeVirtual?: boolean;
+  media?: string;
+  speed?: string;
   search?: string;
   q?: string;
   limit?: number;
@@ -115,6 +121,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  removeDeviceFromTopology: (topologyId: number, deviceId: number) =>
+    request<TopologySummary>(`/api/topologies/${topologyId}/devices/${deviceId}`, {
+      method: 'DELETE',
+    }),
   discoveredZabbixDevices: (topologyId?: number) =>
     request<ZabbixDiscoveredDevice[]>(`/api/zabbix/discovered-devices${topologyId ? `?topologyId=${topologyId}` : ''}`),
   importZabbixToTopology: (topologyId: number, hostids: string[]) =>
@@ -123,6 +133,11 @@ export const api = {
       body: JSON.stringify({ hostids }),
     }),
   exportTopologyJson: (topologyId: number) => request<Record<string, unknown>>(`/api/topologies/${topologyId}/json-export`),
+  dryRunImportTopologyJson: (topologyId: number, payload: Record<string, unknown>) =>
+    request<ImportDryRun>(`/api/topologies/${topologyId}/json-import/dry-run`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   importTopologyJson: (topologyId: number, payload: Record<string, unknown>) =>
     request<TopologySummary>(`/api/topologies/${topologyId}/json-import`, {
       method: 'POST',
@@ -190,6 +205,7 @@ export const api = {
   updateDevice: (id: number, payload: Partial<Device>) => request<Device>(`/api/devices/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteDevice: (id: number) => request<{ ok: boolean }>(`/api/devices/${id}`, { method: 'DELETE' }),
   ports: (params: PortQueryParams = {}) => request<Port[]>(`/api/ports${queryString(params)}`),
+  portsPage: (params: PortQueryParams = {}) => request<PortPage>(`/api/ports/page${queryString(params)}`),
   devicePorts: (id: number, params: DevicePortQueryParams = {}) =>
     request<Port[]>(`/api/devices/${id}/ports${queryString(params)}`),
   createPort: (deviceId: number, payload: Partial<Port> & { name: string }) =>
@@ -197,12 +213,14 @@ export const api = {
   updatePort: (id: number, payload: Partial<Port>) => request<Port>(`/api/ports/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deletePort: (id: number) => request<{ ok: boolean }>(`/api/ports/${id}`, { method: 'DELETE' }),
   portSeries: (id: number, range: string) => request<PortSeries>(`/api/ports/${id}/series?range=${range}`),
-  createCable: (payload: { endpointAPortId: number; endpointBPortId: number; label?: string | null; cableNo?: string | null; vlanId?: number | null; color?: string | null; notes?: string | null }) =>
+  createCable: (payload: { endpointAPortId: number; endpointBPortId: number; replaceExisting?: boolean; label?: string | null; cableNo?: string | null; vlanId?: number | null; color?: string | null; notes?: string | null }) =>
     request<CableLink>('/api/cable-links', { method: 'POST', body: JSON.stringify(payload) }),
   updateCable: (id: number, payload: Partial<CableLink>) => request<CableLink>(`/api/cable-links/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteCable: (id: number) => request<{ ok: boolean }>(`/api/cable-links/${id}`, { method: 'DELETE' }),
   syncStatus: () => request<SyncStatus>('/api/sync/status'),
   syncRuns: (limit = 8) => request<SyncRun[]>(`/api/sync/runs?limit=${limit}`),
+  qualityIssues: (topologyId?: number) => request<QualityIssue[]>(`/api/quality/issues${topologyId ? `?topologyId=${topologyId}` : ''}`),
+  auditLogs: (limit = 50) => request<AuditLog[]>(`/api/audit-logs?limit=${limit}`),
   runSync: (topologyId?: number) =>
     request<SyncRun>(`/api/sync/zabbix/run${topologyId ? `?topologyId=${topologyId}` : ''}`, { method: 'POST' }),
 };

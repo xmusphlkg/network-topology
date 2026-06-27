@@ -1,5 +1,5 @@
 import type { FormEvent, RefObject } from 'react';
-import { Download, Link, Plus, RefreshCw, Save, Upload } from 'lucide-react';
+import { Download, Link, Network, Plus, RefreshCw, Save, Upload } from 'lucide-react';
 import type { TopologySummary } from '../../types';
 import { StatusPill } from '../../components/StatusPill';
 import { normalizeSwitchPortLayoutKey, switchPortLayoutTemplates } from '../../lib/switchPortLayouts';
@@ -20,6 +20,7 @@ interface Props {
   connectModeText: string | null;
   hasUnsavedLayout: boolean;
   onSaveLayout: () => void;
+  onAutoLayout: () => void;
   saveLayoutPending: boolean;
   canSaveLayout: boolean;
   onExportJson: () => void;
@@ -61,6 +62,7 @@ export function TopologyToolbar({
   connectModeText,
   hasUnsavedLayout,
   onSaveLayout,
+  onAutoLayout,
   saveLayoutPending,
   canSaveLayout,
   onExportJson,
@@ -133,6 +135,16 @@ export function TopologyToolbar({
         >
           <Save size={16} />
           <span className="sr-only">{saveLayoutPending ? '保存中...' : '保存布局'}</span>
+        </button>
+        <button
+          className="icon-button"
+          onClick={onAutoLayout}
+          disabled={!canSaveLayout}
+          title="一键重排"
+          aria-label="一键重排"
+          type="button"
+        >
+          <Network size={16} />
         </button>
         <button className="icon-button" onClick={onExportJson} title="导出 JSON" disabled={!topologyId} type="button">
           <Download size={17} />

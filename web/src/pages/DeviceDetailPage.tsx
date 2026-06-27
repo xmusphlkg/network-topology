@@ -107,7 +107,7 @@ export function DeviceDetailPage() {
   useEffect(() => {
     const model = device?.model || '';
     if (!deviceProfiles.data?.length) return;
-    const match = deviceProfiles.data.find((profile) => profile.models.some((item) => item.toLowerCase() === model.toLowerCase()));
+    const match = matchDeviceProfile(model, deviceProfiles.data);
     setSelectedProfile(match?.key || deviceProfiles.data[0]?.key || '');
   }, [device?.model, deviceProfiles.data]);
 
@@ -127,6 +127,11 @@ export function DeviceDetailPage() {
   const downPorts = useMemo(() => (ports.data || []).filter((port) => port.operStatus === 'down').length, [ports.data]);
   const vlanPorts = useMemo(() => (ports.data || []).filter((port) => Boolean(port.vlanSummary?.trim())).length, [ports.data]);
   const manualPorts = useMemo(() => (ports.data || []).filter((port) => port.source === 'manual').length, [ports.data]);
+  const recommendedProfile = useMemo(() => {
+    const model = (device?.model || '').toLowerCase();
+    if (!model || !deviceProfiles.data?.length) return null;
+    return matchDeviceProfile(device?.model || '', deviceProfiles.data);
+  }, [device?.model, deviceProfiles.data]);
 
   useEffect(() => {
     if (!ports.data?.length) {
@@ -395,6 +400,11 @@ export function DeviceDetailPage() {
             <Save size={14} />{t('applyTemplate')}
           </button>
         </div>
+        {recommendedProfile ? (
+          <div className="muted-note tight">
+            推荐模板 {recommendedProfile.key}，模板端口 {recommendedProfile.portCount} 个，当前端口 {totalPorts} 个。
+          </div>
+        ) : null}
         <form id="device-profile-form" className="device-profile-form" onSubmit={submitProfile}>
           <label className="device-profile-select">
             <span>模板</span>
@@ -686,6 +696,16 @@ function numberOrNull(value: string) {
   if (!text) return null;
   const number = Number(text);
   return Number.isFinite(number) ? number : null;
+}
+
+function matchDeviceProfile(model: string, profiles: DeviceProfile[]) {
+  const text = model.trim().toLowerCase();
+  if (!text) return null;
+  return (
+    profiles.find((profile) => profile.models.some((item) => item.toLowerCase() === text)) ||
+    profiles.find((profile) => profile.models.some((item) => text.includes(item.toLowerCase()) || item.toLowerCase().includes(text))) ||
+    null
+  );
 }
 
 function invalidateDeviceData(queryClient: ReturnType<typeof useQueryClient>, deviceId: number) {

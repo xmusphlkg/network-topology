@@ -20,7 +20,6 @@ from ..schemas import (
     TopologyRead,
 )
 from .profiles import profile_for_model, port_sort_key
-from .mapper import is_virtual_port_name
 
 
 def layout_key_for_topology(topology_id: int) -> str:
@@ -38,7 +37,7 @@ async def build_topology_graph(session: AsyncSession, topology: Topology) -> Top
     devices = list(devices_result.scalars().all())
     devices.sort(key=lambda device: ({"switch": 0, "server": 1}.get(device.role, 3), device.display_name))
 
-    ports = [port for device in devices for port in device.ports if not port.stale and not is_virtual_port_name(port.name)]
+    ports = [port for device in devices for port in device.ports if not port.stale and not port.virtual]
     port_ids = [port.id for port in ports]
 
     links_result = await session.execute(
@@ -141,7 +140,7 @@ def _build_node(device: Device, index: int, layout: TopologyLayout | None) -> To
         position = {"x": 80, "y": 80 + index * 260}
     else:
         position = {"x": 720 + (index % 3) * 300, "y": 80 + (index // 3) * 140}
-    ports = sorted([port for port in device.ports if not is_virtual_port_name(port.name)], key=lambda port: port_sort_key(port.name))
+    ports = sorted([port for port in device.ports if not port.virtual], key=lambda port: port_sort_key(port.name))
     return TopologyNode(
         id=f"device-{device.id}",
         type="switchNode" if device.role == "switch" else "endpointNode",

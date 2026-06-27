@@ -9,12 +9,12 @@ from typing import AsyncIterator
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, ORJSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from . import database
 from .clients.zabbix import ZabbixClient
 from .config import get_settings
-from .database import SessionLocal, create_tables, dispose_database, init_database
 from .routes import router
 from .services.sync import run_zabbix_sync
 
@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    init_database(settings)
+    database.init_database(settings)
     if settings.auto_create_tables:
-        await create_tables()
+        await database.create_tables()
     app.state.http = httpx.AsyncClient()
     app.state.zabbix = ZabbixClient(settings=settings, client=app.state.http)
     app.state.sync_task = None
@@ -44,24 +44,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await app.state.sync_task
             except asyncio.CancelledError:
                 pass
+        await app.state.zabbix.close()
         await app.state.http.aclose()
-        await dispose_database()
+        await database.dispose_database()
 
 
 async def sync_loop(app: FastAPI) -> None:
     settings = get_settings()
     while True:
         try:
-            if SessionLocal is not None:
+            sessionmaker = database.SessionLocal
+            if sessionmaker is not None:
                 async with app.state.sync_lock:
-                    async with SessionLocal() as session:
+                    async with sessionmaker() as session:
                         await run_zabbix_sync(session, app.state.zabbix, settings)
         except Exception:
             logger.exception("Automatic Zabbix sync failed")
         await asyncio.sleep(settings.sync_interval_sec)
 
 
-app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan, title="Switch Topology")
+app = FastAPI(lifespan=lifespan, title="Switch Topology")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

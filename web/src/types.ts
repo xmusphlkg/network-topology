@@ -24,6 +24,7 @@ export interface Port {
   identity: string;
   ifIndex?: number | null;
   name: string;
+  virtual: boolean;
   alias?: string | null;
   operStatus: string;
   adminStatus: string;
@@ -40,6 +41,13 @@ export interface Port {
   stale: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PortPage {
+  items: Port[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface CableLink {
@@ -218,6 +226,9 @@ export interface ZabbixDiscoveredDevice {
   mgmtIp?: string | null;
   portCount: number;
   synced: boolean;
+  action?: 'new' | 'update' | 'synced';
+  existingDeviceId?: number | null;
+  changes?: Array<{ field: string; current?: string | number | boolean | null; incoming?: string | number | boolean | null }>;
 }
 
 export interface SeriesPoint {
@@ -244,9 +255,44 @@ export interface SyncRun {
   portsUpserted: number;
   staleDevices: number;
   errorMessage?: string | null;
+  details?: Record<string, unknown> | null;
 }
 
 export interface SyncStatus {
   latest?: SyncRun | null;
   zabbixConfigured: boolean;
+  readOnly?: boolean;
+}
+
+export interface ImportDryRun {
+  valid: boolean;
+  devices: number;
+  ports: number;
+  cableLinks: number;
+  layouts: number;
+  existingDevices: number;
+  newDevices: number;
+  warnings: string[];
+}
+
+export interface QualityIssue {
+  id: string;
+  severity: 'critical' | 'warning' | 'info';
+  category: string;
+  title: string;
+  message: string;
+  deviceId?: number | null;
+  portId?: number | null;
+  linkId?: number | null;
+  topologyId?: number | null;
+}
+
+export interface AuditLog {
+  id: number;
+  actor?: string | null;
+  action: string;
+  resourceType: string;
+  resourceId?: string | null;
+  details?: Record<string, unknown> | null;
+  createdAt: string;
 }

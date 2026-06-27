@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -14,8 +14,9 @@ from sqlalchemy.orm import selectinload
 from .clients.zabbix import ZabbixClient
 from .config import Settings, get_settings
 from .database import get_session
-from .db_models import CableLink, Device, Port, Topology, TopologyDevice, TopologyLayout, ZabbixSyncRun
+from .db_models import AuditLog, CableLink, Device, Port, Topology, TopologyDevice, TopologyLayout, ZabbixSyncRun
 from .schemas import (
+    AuditLogRead,
     CableLinkCreate,
     CableLinkRead,
     CableLinkUpdate,
@@ -24,9 +25,11 @@ from .schemas import (
     DeviceUpdate,
     LayoutUpdate,
     PortCreate,
+    PortPage,
     PortRead,
     PortSeries,
     PortUpdate,
+    QualityIssue,
     SeriesPoint,
     SyncRunRead,
     SyncStatus,
@@ -34,7 +37,9 @@ from .schemas import (
     TopologyDeviceIds,
     TopologyGraphRead,
     TopologyImportRequest,
+    ImportDryRunRead,
     TopologyRead,
+    ZabbixDeviceChange,
     DeviceProfileApplyRequest,
     IngestCable,
     IngestDevice,
@@ -73,6 +78,8 @@ PORT_OVERRIDE_FIELDS = {
     "vlanSummary": "vlan_summary",
     "poeStatus": "poe_status",
 }
+PROTECTED_DEVICE_SOURCES = {"manual", "zabbix"}
+PROTECTED_PORT_SOURCES = {"manual", "zabbix", "profile"}
 
 
 def zabbix_from_request(request: Request) -> ZabbixClient:
@@ -85,6 +92,40 @@ def sync_lock_from_request(request: Request) -> asyncio.Lock:
         lock = asyncio.Lock()
         request.app.state.sync_lock = lock
     return lock
+
+
+def require_write_permission(
+    settings: Settings = Depends(get_settings),
+    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
+) -> None:
+    if not settings.read_only_mode:
+        return
+    if settings.admin_token and x_admin_token == settings.admin_token:
+        return
+    raise HTTPException(status_code=403, detail="Application is in read-only mode")
+
+
+def actor_from_request(request: Request) -> str | None:
+    return request.headers.get("X-Actor") or request.headers.get("X-User") or None
+
+
+async def record_audit(
+    session: AsyncSession,
+    request: Request | None,
+    action: str,
+    resource_type: str,
+    resource_id: object | None,
+    details: dict | None = None,
+) -> None:
+    session.add(
+        AuditLog(
+            actor=actor_from_request(request) if request else None,
+            action=action,
+            resource_type=resource_type,
+            resource_id=str(resource_id) if resource_id is not None else None,
+            details_json=json.dumps(details or {}, ensure_ascii=False, separators=(",", ":")),
+        )
+    )
 
 
 async def run_zabbix_sync_serialized(
@@ -212,6 +253,35 @@ async def ensure_zabbix_hostid_available(session: AsyncSession, hostid: str | No
         raise HTTPException(status_code=409, detail="Zabbix host already exists")
 
 
+def zabbix_discovered_device_read(snapshot, existing: Device | None, synced: bool) -> ZabbixDiscoveredDevice:
+    changes: list[ZabbixDeviceChange] = []
+    if existing is not None:
+        comparisons = [
+            ("displayName", existing.display_name, snapshot.display_name),
+            ("role", existing.role, snapshot.role),
+            ("model", existing.model, snapshot.model),
+            ("mgmtIp", existing.mgmt_ip, snapshot.mgmt_ip),
+        ]
+        for field, current, incoming in comparisons:
+            if current != incoming and incoming is not None:
+                changes.append(ZabbixDeviceChange(field=field, current=current, incoming=incoming))
+    action: Literal["new", "update", "synced"] = "new"
+    if existing is not None:
+        action = "synced" if synced and not changes else "update"
+    return ZabbixDiscoveredDevice(
+        zabbixHostid=snapshot.zabbix_hostid,
+        displayName=snapshot.display_name,
+        role=snapshot.role,
+        model=snapshot.model,
+        mgmtIp=snapshot.mgmt_ip,
+        portCount=len(snapshot.ports),
+        synced=synced,
+        action=action,
+        existingDeviceId=existing.id if existing else None,
+        changes=changes,
+    )
+
+
 def normalized_port_create_items(ports: list[PortCreate]) -> list[tuple[PortCreate, str]]:
     seen: set[str] = set()
     normalized: list[tuple[PortCreate, str]] = []
@@ -302,6 +372,8 @@ async def topologies(session: AsyncSession = Depends(get_session)) -> list[Topol
 @router.post("/topologies", response_model=TopologyRead)
 async def create_topology(
     payload: TopologyCreate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
     session: AsyncSession = Depends(get_session),
 ) -> Topology:
     name = clean_required_text(payload.name, "Topology name is required")
@@ -316,6 +388,7 @@ async def create_topology(
     session.add(topology)
     await session.flush()
     topology.device_count = 0
+    await record_audit(session, request, "topology.create", "topology", topology.id, {"name": topology.name})
     await session.commit()
     return await hydrate_topology_counts(session, topology)
 
@@ -324,6 +397,8 @@ async def create_topology(
 async def update_topology(
     topology_id: int,
     payload: TopologyUpdate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
     session: AsyncSession = Depends(get_session),
 ) -> Topology:
     topology = await get_topology_by_id(session, topology_id)
@@ -336,6 +411,7 @@ async def update_topology(
         setattr(topology, field_map.get(key, key), value)
     if payload.isDefault:
         await session.execute(update(Topology).where(Topology.id != topology.id).values(is_default=False))
+    await record_audit(session, request, "topology.update", "topology", topology.id, data)
     await session.commit()
     return await hydrate_topology_counts(session, topology)
 
@@ -344,6 +420,8 @@ async def update_topology(
 async def link_devices_to_topology(
     topology_id: int,
     payload: TopologyDeviceIds,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
     session: AsyncSession = Depends(get_session),
 ) -> Topology:
     topology = await get_topology_by_id(session, topology_id)
@@ -352,8 +430,36 @@ async def link_devices_to_topology(
         existing_ids = [device_id for device_id in result.scalars().all()]
         if not existing_ids:
             raise HTTPException(status_code=400, detail="No valid device ids")
-        await attach_devices_to_topology(session, topology, existing_ids)
+        created = await attach_devices_to_topology(session, topology, existing_ids)
+        await record_audit(session, request, "topology.devices.add", "topology", topology.id, {"deviceIds": existing_ids, "created": created})
         await session.commit()
+    return await hydrate_topology_counts(session, topology)
+
+
+@router.delete("/topologies/{topology_id}/devices/{device_id}", response_model=TopologyRead)
+async def unlink_device_from_topology(
+    topology_id: int,
+    device_id: int,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> Topology:
+    topology = await get_topology_by_id(session, topology_id)
+    await get_device_or_404(session, device_id)
+    await session.execute(
+        delete(TopologyDevice).where(
+            TopologyDevice.topology_id == topology.id,
+            TopologyDevice.device_id == device_id,
+        )
+    )
+    await session.execute(
+        delete(TopologyLayout).where(
+            TopologyLayout.layout_key == layout_key_for_topology(topology.id),
+            TopologyLayout.node_id == f"device-{device_id}",
+        )
+    )
+    await record_audit(session, request, "topology.devices.remove", "topology", topology.id, {"deviceId": device_id})
+    await session.commit()
     return await hydrate_topology_counts(session, topology)
 
 
@@ -379,16 +485,11 @@ async def discovered_zabbix_devices(
         synced_hostids = {row[1] for row in exists.all()}
     else:
         synced_hostids = set()
+    hostids = [snapshot.zabbix_hostid for snapshot in snapshots]
+    existing_devices_result = await session.execute(select(Device).where(Device.zabbix_hostid.in_(hostids))) if hostids else None
+    existing_by_hostid = {device.zabbix_hostid: device for device in existing_devices_result.scalars().all()} if existing_devices_result is not None else {}
     return [
-        ZabbixDiscoveredDevice(
-            zabbixHostid=snapshot.zabbix_hostid,
-            displayName=snapshot.display_name,
-            role=snapshot.role,
-            model=snapshot.model,
-            mgmtIp=snapshot.mgmt_ip,
-            portCount=len(snapshot.ports),
-            synced=snapshot.zabbix_hostid in synced_hostids,
-        )
+        zabbix_discovered_device_read(snapshot, existing_by_hostid.get(snapshot.zabbix_hostid), snapshot.zabbix_hostid in synced_hostids)
         for snapshot in snapshots
     ]
 
@@ -398,6 +499,7 @@ async def sync_and_import_topology(
     topology_id: int,
     payload: TopologyImportRequest,
     request: Request,
+    _permission: None = Depends(require_write_permission),
     session: AsyncSession = Depends(get_session),
     zabbix: ZabbixClient = Depends(zabbix_from_request),
     settings: Settings = Depends(get_settings),
@@ -421,13 +523,19 @@ async def sync_and_import_topology(
     device_ids = [device_id for device_id in result.scalars().all()]
     if not device_ids:
         raise HTTPException(status_code=400, detail="No discovered host selected")
-    await attach_devices_to_topology(session, topology, device_ids)
+    created = await attach_devices_to_topology(session, topology, device_ids)
+    await record_audit(session, request, "topology.zabbix_import", "topology", topology.id, {"hostids": sorted(selected), "deviceIds": device_ids, "created": created})
     await session.commit()
     return await hydrate_topology_counts(session, topology)
 
 
 @router.post("/devices", response_model=DeviceRead)
-async def create_device(payload: DeviceCreate, session: AsyncSession = Depends(get_session)) -> Device:
+async def create_device(
+    payload: DeviceCreate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> Device:
     display_name = clean_required_text(payload.displayName, "Device display name is required")
     zabbix_hostid = clean_optional_str(payload.zabbixHostid)
     await ensure_zabbix_hostid_available(session, zabbix_hostid)
@@ -450,13 +558,20 @@ async def create_device(payload: DeviceCreate, session: AsyncSession = Depends(g
         session.add(port_from_create(device.id, item, name=name))
     topology = await (get_default_topology(session) if payload.topologyId is None else get_topology_by_id(session, payload.topologyId))
     await attach_devices_to_topology(session, topology, [device.id])
+    await record_audit(session, request, "device.create", "device", device.id, {"displayName": device.display_name, "topologyId": topology.id})
     await session.commit()
     await session.refresh(device)
     return device
 
 
 @router.patch("/devices/{device_id}", response_model=DeviceRead)
-async def update_device(device_id: int, payload: DeviceUpdate, session: AsyncSession = Depends(get_session)) -> Device:
+async def update_device(
+    device_id: int,
+    payload: DeviceUpdate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> Device:
     device = await get_device_or_404(session, device_id)
     data = payload.model_dump(exclude_unset=True)
     if "displayName" in data:
@@ -472,13 +587,20 @@ async def update_device(device_id: int, payload: DeviceUpdate, session: AsyncSes
     for key, value in data.items():
         setattr(device, field_map.get(key, key), value)
     mark_overrides(device, {DEVICE_OVERRIDE_FIELDS[key] for key in data if key in DEVICE_OVERRIDE_FIELDS})
+    await record_audit(session, request, "device.update", "device", device.id, data)
     await session.commit()
     await session.refresh(device)
     return device
 
 
 @router.post("/devices/{device_id}/apply-profile", response_model=DeviceRead)
-async def apply_profile_ports(device_id: int, payload: DeviceProfileApplyRequest, session: AsyncSession = Depends(get_session)) -> Device:
+async def apply_profile_ports(
+    device_id: int,
+    payload: DeviceProfileApplyRequest,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> Device:
     device = await get_device_or_404(session, device_id)
     profile = get_profile(payload.profileKey)
     if profile is None:
@@ -517,6 +639,7 @@ async def apply_profile_ports(device_id: int, payload: DeviceProfileApplyRequest
                 source="profile",
                 identity=f"profile:{normalized}",
                 name=profile_port.name,
+                virtual=False,
                 oper_status="unknown",
                 admin_status="unknown",
                 speed_mbps=profile_port.speed_mbps,
@@ -534,29 +657,50 @@ async def apply_profile_ports(device_id: int, payload: DeviceProfileApplyRequest
     elif device.role == "custom":
         # 如果是非交换机模板且设备仍为自定义类型，保留原角色，避免误改服务器类型。
         device.role = "custom"
+    await record_audit(session, request, "device.apply_profile", "device", device.id, {"profileKey": payload.profileKey, "replaceProfilePorts": payload.replaceProfilePorts})
     await session.commit()
     await session.refresh(device)
     return device
 
 
 @router.post("/sync/ingest", response_model=IngestResult)
-async def ingest_from_agent(payload: IngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
-    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts)
+async def ingest_from_agent(
+    payload: IngestRequest,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> IngestResult:
+    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts, request=request)
 
 
 @router.post("/sync/push", response_model=IngestResult)
-async def push_from_agent(payload: IngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
-    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts)
+async def push_from_agent(
+    payload: IngestRequest,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> IngestResult:
+    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts, request=request)
 
 
 @router.post("/sync/command-push", response_model=IngestResult)
-async def push_from_command(payload: IngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
+async def push_from_command(
+    payload: IngestRequest,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> IngestResult:
     """Endpoint for server-side command runners / automation to submit discovered device inventory."""
-    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts)
+    return await _ingest_payload(session, payload, strict_physical_ports=payload.strictPhysicalPorts, request=request)
 
 
 @router.post("/sync/ip-addr", response_model=IngestResult)
-async def push_from_ip_addr(payload: IpAddrIngestRequest, session: AsyncSession = Depends(get_session)) -> IngestResult:
+async def push_from_ip_addr(
+    payload: IpAddrIngestRequest,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> IngestResult:
     topology = await (get_default_topology(session) if payload.topologyId is None else get_topology_by_id(session, payload.topologyId))
     ports = parse_ip_addr_ports(payload.output)
     ingest_payload = IngestRequest(
@@ -576,18 +720,20 @@ async def push_from_ip_addr(payload: IpAddrIngestRequest, session: AsyncSession 
         ],
         cables=[],
     )
-    return await _ingest_payload(session, ingest_payload, strict_physical_ports=payload.strictPhysicalPorts)
+    return await _ingest_payload(session, ingest_payload, strict_physical_ports=payload.strictPhysicalPorts, request=request)
 
 
 async def _ingest_payload(
     session: AsyncSession,
     payload: IngestRequest,
     strict_physical_ports: bool,
+    request: Request | None = None,
 ) -> IngestResult:
     topology = None
     if payload.topologyId is not None:
         topology = await get_topology_by_id(session, payload.topologyId)
 
+    source_key = _normalize_ingest_source(payload.source)
     device_id_cache: dict[str, Device] = {}
     ports_by_device_key: dict[int, set[str]] = {}
     cable_count = 0
@@ -598,7 +744,7 @@ async def _ingest_payload(
     for device_payload in payload.devices:
         accepted_physical_count = 0
         device_strict_physical_ports = strict_physical_ports or device_payload.strictPhysicalPorts
-        device = await _find_or_create_device_for_ingest(session, payload.source, device_payload)
+        device = await _find_or_create_device_for_ingest(session, source_key, device_payload)
         seen_device_ids.add(device.id)
         for key in _ingest_device_cache_keys(device_payload, device):
             device_id_cache[key] = device
@@ -620,7 +766,7 @@ async def _ingest_payload(
             port_identity, upserted = await _upsert_ingest_port(
                 session,
                 device.id,
-                payload.source,
+                source_key,
                 port_payload,
                 strict_physical_ports=device_strict_physical_ports,
             )
@@ -634,10 +780,8 @@ async def _ingest_payload(
     # Mark stale ports for this ingest source only, per device.
     if ports_by_device_key:
         for device_id, seen_identities in ports_by_device_key.items():
-            if not seen_identities:
-                continue
             all_ports = await session.execute(
-                select(Port).where(Port.device_id == device_id, Port.source == payload.source)
+                select(Port).where(Port.device_id == device_id, Port.source == source_key)
             )
             for port in all_ports.scalars().all():
                 port.stale = _normalize_ingest_port_identity(port.name) not in seen_identities
@@ -682,16 +826,23 @@ async def _ingest_payload(
                 link.verified_at = None
             cable_count += 1
 
-    await session.commit()
-    return IngestResult(
+    result = IngestResult(
         devices=len(seen_device_ids),
         ports=seen_ports,
         cables=cable_count,
     )
+    await record_audit(session, request, "sync.ingest", "sync", None, {"source": source_key, "devices": result.devices, "ports": result.ports, "cables": result.cables})
+    await session.commit()
+    return result
 
 
 @router.delete("/devices/{device_id}")
-async def delete_device(device_id: int, session: AsyncSession = Depends(get_session)) -> dict:
+async def delete_device(
+    device_id: int,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
     device = await get_device_or_404(session, device_id)
     ports_result = await session.execute(select(Port.id).where(Port.device_id == device.id))
     port_ids = list(ports_result.scalars().all())
@@ -705,6 +856,7 @@ async def delete_device(device_id: int, session: AsyncSession = Depends(get_sess
             )
         )
     await session.execute(delete(TopologyDevice).where(TopologyDevice.device_id == device.id))
+    await record_audit(session, request, "device.delete", "device", device.id, {"displayName": device.display_name})
     await session.delete(device)
     await session.commit()
     return {"ok": True}
@@ -717,15 +869,22 @@ async def device_ports(
     session: AsyncSession = Depends(get_session),
 ) -> list[Port]:
     await get_device_or_404(session, device_id)
-    result = await session.execute(select(Port).where(Port.device_id == device_id))
-    ports = list(result.scalars().all())
+    stmt = select(Port).where(Port.device_id == device_id)
     if not include_virtual:
-        ports = [port for port in ports if not is_virtual_port_name(port.name)]
+        stmt = stmt.where(Port.virtual.is_(False))
+    result = await session.execute(stmt)
+    ports = list(result.scalars().all())
     return sorted(ports, key=lambda port: port_sort_key(port.name))
 
 
 @router.post("/devices/{device_id}/ports", response_model=PortRead)
-async def create_port(device_id: int, payload: PortCreate, session: AsyncSession = Depends(get_session)) -> Port:
+async def create_port(
+    device_id: int,
+    payload: PortCreate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> Port:
     device = await get_device_or_404(session, device_id)
     name = clean_required_text(payload.name, "Port name is required")
     identity = manual_port_identity(name)
@@ -738,13 +897,20 @@ async def create_port(device_id: int, payload: PortCreate, session: AsyncSession
     device.stale = False
     if device.health == "stale":
         device.health = "unknown"
+    await session.flush()
+    await record_audit(session, request, "port.create", "port", port.id, {"deviceId": device_id, "name": port.name})
     await session.commit()
     await session.refresh(port)
     return port
 
 
 @router.delete("/ports/{port_id}")
-async def delete_port(port_id: int, session: AsyncSession = Depends(get_session)) -> dict:
+async def delete_port(
+    port_id: int,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
     port = await get_port_or_404(session, port_id)
     await session.execute(
         delete(CableLink).where(
@@ -754,6 +920,7 @@ async def delete_port(port_id: int, session: AsyncSession = Depends(get_session)
             )
         )
     )
+    await record_audit(session, request, "port.delete", "port", port.id, {"deviceId": port.device_id, "name": port.name})
     await session.delete(port)
     await session.commit()
     return {"ok": True}
@@ -786,21 +953,82 @@ async def ports(
     if search:
         like = f"%{search}%"
         stmt = stmt.where(or_(Port.name.like(like), Port.alias.like(like), Port.vlan_summary.like(like), Port.mac_address.like(like)))
-    stmt = stmt.order_by(Port.device_id, Port.name)
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
     if not include_virtual:
-        rows = [port for port in rows if not is_virtual_port_name(port.name)]
-
+        stmt = stmt.where(Port.virtual.is_(False))
+    stmt = stmt.order_by(Port.device_id, Port.name)
     if offset:
-        rows = rows[offset:]
+        stmt = stmt.offset(offset)
     if limit is not None:
-        rows = rows[:limit]
-    return rows
+        stmt = stmt.limit(limit)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+@router.get("/ports/page", response_model=PortPage)
+async def ports_page(
+    topology_id: int | None = Query(None, alias="topologyId"),
+    status: str | None = Query(None),
+    include_stale: bool = Query(True, alias="includeStale"),
+    include_virtual: bool = Query(False, alias="includeVirtual"),
+    media: str | None = Query(None),
+    speed_filter: Literal["slow", "1g", "10g"] | None = Query(None, alias="speed"),
+    limit: int = Query(80, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    search: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> PortPage:
+    stmt = select(Port).join(Device, Device.id == Port.device_id)
+    if topology_id is not None:
+        await get_topology_by_id(session, topology_id)
+        stmt = stmt.join(TopologyDevice, TopologyDevice.device_id == Port.device_id).where(TopologyDevice.topology_id == topology_id)
+    if status == "stale":
+        stmt = stmt.where(Port.stale.is_(True))
+    elif status:
+        stmt = stmt.where(Port.oper_status == status)
+    if not include_stale and status != "stale":
+        stmt = stmt.where(Port.stale.is_(False))
+    if not include_virtual:
+        stmt = stmt.where(Port.virtual.is_(False))
+    if media:
+        stmt = stmt.where(Port.media == media)
+    if speed_filter == "slow":
+        stmt = stmt.where(or_(Port.speed_mbps.is_(None), Port.speed_mbps < 1000))
+    elif speed_filter == "1g":
+        stmt = stmt.where(Port.speed_mbps >= 1000)
+    elif speed_filter == "10g":
+        stmt = stmt.where(Port.speed_mbps >= 10000)
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(
+            or_(
+                Port.name.like(like),
+                Port.alias.like(like),
+                Port.vlan_summary.like(like),
+                Port.mac_address.like(like),
+                Device.display_name.like(like),
+                Device.mgmt_ip.like(like),
+                Device.model.like(like),
+            )
+        )
+    count_result = await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    total = count_result.scalar_one() or 0
+    rows_result = await session.execute(stmt.order_by(Port.device_id, Port.name).offset(offset).limit(limit))
+    return PortPage(
+        items=[PortRead.model_validate(port) for port in rows_result.scalars().all()],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.patch("/ports/{port_id}", response_model=PortRead)
-async def update_port(port_id: int, payload: PortUpdate, session: AsyncSession = Depends(get_session)) -> Port:
+async def update_port(
+    port_id: int,
+    payload: PortUpdate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> Port:
     port = await get_port_or_404(session, port_id)
     data = payload.model_dump(exclude_unset=True)
     if "name" in data:
@@ -827,7 +1055,10 @@ async def update_port(port_id: int, payload: PortUpdate, session: AsyncSession =
     }
     for key, value in data.items():
         setattr(port, field_map.get(key, key), value)
+    if "name" in data:
+        port.virtual = is_virtual_port_name(port.name)
     mark_overrides(port, {PORT_OVERRIDE_FIELDS[key] for key in data if key in PORT_OVERRIDE_FIELDS})
+    await record_audit(session, request, "port.update", "port", port.id, data)
     await session.commit()
     await session.refresh(port)
     return port
@@ -924,17 +1155,35 @@ async def export_topology_json(topology_id: int, session: AsyncSession = Depends
 @router.post("/topologies/{topology_id}/json-import", response_model=TopologyRead)
 async def import_topology_json(
     topology_id: int,
+    request: Request,
     payload: dict = Body(...),
+    _permission: None = Depends(require_write_permission),
     session: AsyncSession = Depends(get_session),
 ) -> Topology:
     topology = await get_topology_by_id(session, topology_id)
     await import_topology_payload(session, topology, payload)
+    await record_audit(session, request, "topology.json_import", "topology", topology.id, import_topology_dry_run_summary(payload))
     await session.commit()
     return await hydrate_topology_counts(session, topology)
 
 
+@router.post("/topologies/{topology_id}/json-import/dry-run", response_model=ImportDryRunRead)
+async def import_topology_json_dry_run(
+    topology_id: int,
+    payload: dict = Body(...),
+    session: AsyncSession = Depends(get_session),
+) -> ImportDryRunRead:
+    await get_topology_by_id(session, topology_id)
+    return await analyze_import_topology_payload(session, payload)
+
+
 @router.patch("/topology/layout")
-async def save_layout(payload: LayoutUpdate, session: AsyncSession = Depends(get_session)) -> dict[str, bool]:
+async def save_layout(
+    payload: LayoutUpdate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
     for node in payload.nodes:
         result = await session.execute(
             select(TopologyLayout).where(TopologyLayout.layout_key == payload.layoutKey, TopologyLayout.node_id == node.nodeId)
@@ -954,6 +1203,7 @@ async def save_layout(payload: LayoutUpdate, session: AsyncSession = Depends(get
         layout_result = await session.execute(select(TopologyLayout).where(TopologyLayout.layout_key == payload.layoutKey))
         for layout in layout_result.scalars().all():
             layout.viewport_json = json.dumps(payload.viewport)
+    await record_audit(session, request, "topology.layout.save", "layout", payload.layoutKey, {"nodes": len(payload.nodes), "viewport": payload.viewport is not None})
     await session.commit()
     return {"ok": True}
 
@@ -970,6 +1220,78 @@ def export_endpoint_ref(port_id: int, port_by_id: dict[int, Port], device_by_id:
         "portName": port.name if port else None,
         "macAddress": port.mac_address if port else None,
     }
+
+
+def import_topology_dry_run_summary(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"devices": 0, "ports": 0, "cableLinks": 0, "layouts": 0}
+    devices = payload.get("devices")
+    ports = payload.get("ports")
+    cable_links = payload.get("cableLinks") or payload.get("cables")
+    layout = payload.get("layout")
+    layout_nodes = layout.get("nodes") if isinstance(layout, dict) else []
+    nested_ports = 0
+    if isinstance(devices, list):
+        for device in devices:
+            if isinstance(device, dict) and isinstance(device.get("ports"), list):
+                nested_ports += len(device["ports"])
+    return {
+        "devices": len(devices) if isinstance(devices, list) else 0,
+        "ports": nested_ports + (len(ports) if isinstance(ports, list) else 0),
+        "cableLinks": len(cable_links) if isinstance(cable_links, list) else 0,
+        "layouts": len(layout_nodes) if isinstance(layout_nodes, list) else 0,
+    }
+
+
+async def analyze_import_topology_payload(session: AsyncSession, payload: dict) -> ImportDryRunRead:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid topology JSON")
+    devices_data = payload.get("devices")
+    if not isinstance(devices_data, list):
+        raise HTTPException(status_code=400, detail="Topology JSON must include devices")
+    summary = import_topology_dry_run_summary(payload)
+    warnings: list[str] = []
+    existing_devices = 0
+    seen_names: set[str] = set()
+    seen_hostids: set[str] = set()
+    for device_data in devices_data:
+        if not isinstance(device_data, dict):
+            warnings.append("跳过了一个非对象设备条目")
+            continue
+        display_name = clean_optional_str(device_data.get("displayName") or device_data.get("display_name"))
+        zabbix_hostid = clean_optional_str(device_data.get("zabbixHostid") or device_data.get("zabbix_hostid"))
+        role = import_role(device_data.get("role"))
+        if display_name:
+            key = f"{role}:{display_name}"
+            if key in seen_names:
+                warnings.append(f"导入文件中存在重复设备名称：{display_name}")
+            seen_names.add(key)
+        if zabbix_hostid:
+            if zabbix_hostid in seen_hostids:
+                warnings.append(f"导入文件中存在重复 Zabbix hostid：{zabbix_hostid}")
+            seen_hostids.add(zabbix_hostid)
+            exists = await session.execute(select(Device.id).where(Device.zabbix_hostid == zabbix_hostid))
+            if exists.scalar_one_or_none() is not None:
+                existing_devices += 1
+                continue
+        if display_name:
+            exists = await session.execute(select(Device.id).where(Device.display_name == display_name, Device.role == role))
+            if exists.scalar_one_or_none() is not None:
+                existing_devices += 1
+    if summary["devices"] == 0:
+        warnings.append("导入文件没有设备")
+    if summary["cableLinks"] and summary["ports"] == 0:
+        warnings.append("导入文件包含线缆但没有端口，线缆可能无法解析")
+    return ImportDryRunRead(
+        valid=True,
+        devices=summary["devices"],
+        ports=summary["ports"],
+        cableLinks=summary["cableLinks"],
+        layouts=summary["layouts"],
+        existingDevices=existing_devices,
+        newDevices=max(summary["devices"] - existing_devices, 0),
+        warnings=warnings,
+    )
 
 
 async def import_topology_payload(session: AsyncSession, topology: Topology, payload: dict) -> None:
@@ -1066,6 +1388,7 @@ async def upsert_import_port(session: AsyncSession, device: Device, data: dict) 
     port.identity = identity
     port.if_index = int_or_none(data.get("ifIndex") or data.get("if_index"))
     port.name = name
+    port.virtual = is_virtual_port_name(name)
     port.alias = clean_optional_str(data.get("alias"))
     port.oper_status = clean_optional_str(data.get("operStatus") or data.get("oper_status")) or "unknown"
     port.admin_status = clean_optional_str(data.get("adminStatus") or data.get("admin_status")) or "unknown"
@@ -1208,7 +1531,12 @@ def vlan_id_or_none(value: object) -> int | None:
 
 
 @router.post("/cable-links", response_model=CableLinkRead)
-async def create_cable_link(payload: CableLinkCreate, session: AsyncSession = Depends(get_session)) -> CableLink:
+async def create_cable_link(
+    payload: CableLinkCreate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> CableLink:
     a = await get_port_or_404(session, payload.endpointAPortId)
     b = await get_port_or_404(session, payload.endpointBPortId)
     if a.id == b.id:
@@ -1222,8 +1550,26 @@ async def create_cable_link(payload: CableLinkCreate, session: AsyncSession = De
             )
         )
     )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Cable link already exists")
+    existing_pair = existing.scalar_one_or_none()
+    if existing_pair:
+        if not payload.replaceExisting:
+            raise HTTPException(status_code=409, detail="Cable link already exists")
+        existing_pair.label = payload.label
+        existing_pair.cable_no = payload.cableNo
+        existing_pair.vlan_id = payload.vlanId
+        existing_pair.color = payload.color
+        existing_pair.notes = payload.notes
+        existing_pair.verified_at = payload.verifiedAt
+        existing_pair.created_by = payload.createdBy
+        await record_audit(session, request, "cable.update", "cable", existing_pair.id, {"replaceExisting": True})
+        await session.commit()
+        await session.refresh(existing_pair)
+        return existing_pair
+    conflicts = await cable_conflicts_for_ports(session, [endpoint_a, endpoint_b])
+    if conflicts and not payload.replaceExisting:
+        raise HTTPException(status_code=409, detail="Cable endpoint is already connected")
+    for conflict in conflicts:
+        await session.delete(conflict)
     link = CableLink(
         endpoint_a_port_id=endpoint_a,
         endpoint_b_port_id=endpoint_b,
@@ -1236,26 +1582,48 @@ async def create_cable_link(payload: CableLinkCreate, session: AsyncSession = De
         created_by=payload.createdBy,
     )
     session.add(link)
+    await session.flush()
+    await record_audit(
+        session,
+        request,
+        "cable.create",
+        "cable",
+        link.id,
+        {"endpointAPortId": endpoint_a, "endpointBPortId": endpoint_b, "replacedLinks": [item.id for item in conflicts]},
+    )
     await session.commit()
     await session.refresh(link)
     return link
 
 
 @router.patch("/cable-links/{link_id}", response_model=CableLinkRead)
-async def update_cable_link(link_id: int, payload: CableLinkUpdate, session: AsyncSession = Depends(get_session)) -> CableLink:
+async def update_cable_link(
+    link_id: int,
+    payload: CableLinkUpdate,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> CableLink:
     link = await get_link_or_404(session, link_id)
     data = payload.model_dump(exclude_unset=True)
     field_map = {"cableNo": "cable_no", "vlanId": "vlan_id", "verifiedAt": "verified_at", "createdBy": "created_by"}
     for key, value in data.items():
         setattr(link, field_map.get(key, key), value)
+    await record_audit(session, request, "cable.update", "cable", link.id, data)
     await session.commit()
     await session.refresh(link)
     return link
 
 
 @router.delete("/cable-links/{link_id}")
-async def delete_cable_link(link_id: int, session: AsyncSession = Depends(get_session)) -> dict[str, bool]:
+async def delete_cable_link(
+    link_id: int,
+    request: Request,
+    _permission: None = Depends(require_write_permission),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
     link = await get_link_or_404(session, link_id)
+    await record_audit(session, request, "cable.delete", "cable", link.id, {"endpointAPortId": link.endpoint_a_port_id, "endpointBPortId": link.endpoint_b_port_id})
     await session.delete(link)
     await session.commit()
     return {"ok": True}
@@ -1292,6 +1660,7 @@ async def port_series(
 async def trigger_sync(
     request: Request,
     topologyId: int | None = Query(None, alias="topologyId"),
+    _permission: None = Depends(require_write_permission),
     session: AsyncSession = Depends(get_session),
     zabbix: ZabbixClient = Depends(zabbix_from_request),
     settings: Settings = Depends(get_settings),
@@ -1299,21 +1668,9 @@ async def trigger_sync(
     if not settings.zabbix_configured():
         raise HTTPException(status_code=503, detail="Zabbix credentials are not configured")
     run = await run_zabbix_sync_serialized(request, session, zabbix, settings)
-    if topologyId is None or run.status != "success":
-        return run
-
-    topology = await get_topology_by_id(session, topologyId)
-    result = await session.execute(
-        select(Device.id).where(
-            Device.source == "zabbix",
-            Device.enabled.is_(True),
-            Device.stale.is_(False),
-        ),
-    )
-    device_ids = list(result.scalars().all())
-    if device_ids:
-        await attach_devices_to_topology(session, topology, device_ids)
-        await session.commit()
+    await record_audit(session, request, "sync.zabbix.run", "sync_run", run.id, {"status": run.status})
+    await session.commit()
+    await session.refresh(run)
     return run
 
 
@@ -1324,7 +1681,11 @@ async def sync_status(
 ) -> SyncStatus:
     result = await session.execute(select(ZabbixSyncRun).order_by(ZabbixSyncRun.id.desc()).limit(1))
     latest = result.scalar_one_or_none()
-    return SyncStatus(latest=SyncRunRead.model_validate(latest) if latest else None, zabbixConfigured=settings.zabbix_configured())
+    return SyncStatus(
+        latest=SyncRunRead.model_validate(latest) if latest else None,
+        zabbixConfigured=settings.zabbix_configured(),
+        readOnly=settings.read_only_mode,
+    )
 
 
 @router.get("/sync/runs", response_model=list[SyncRunRead])
@@ -1336,8 +1697,129 @@ async def sync_runs(
     return list(result.scalars().all())
 
 
+@router.get("/quality/issues", response_model=list[QualityIssue])
+async def quality_issues(
+    topology_id: int | None = Query(None, alias="topologyId"),
+    session: AsyncSession = Depends(get_session),
+) -> list[QualityIssue]:
+    if topology_id is not None:
+        await get_topology_by_id(session, topology_id)
+    return await collect_quality_issues(session, topology_id)
+
+
+@router.get("/audit-logs", response_model=list[AuditLogRead])
+async def audit_logs(
+    limit: int = Query(50, ge=1, le=200),
+    resource_type: str | None = Query(None, alias="resourceType"),
+    session: AsyncSession = Depends(get_session),
+) -> list[AuditLog]:
+    stmt = select(AuditLog)
+    if resource_type:
+        stmt = stmt.where(AuditLog.resource_type == resource_type)
+    result = await session.execute(stmt.order_by(AuditLog.id.desc()).limit(limit))
+    return list(result.scalars().all())
+
+
+async def collect_quality_issues(session: AsyncSession, topology_id: int | None = None) -> list[QualityIssue]:
+    issues: list[QualityIssue] = []
+    scoped_device_ids: set[int] | None = None
+    if topology_id is not None:
+        scoped_device_ids = set(await get_topology_ids_for_graph(session, topology_id))
+
+    device_stmt = select(Device)
+    if scoped_device_ids is not None:
+        if not scoped_device_ids:
+            return []
+        device_stmt = device_stmt.where(Device.id.in_(scoped_device_ids))
+    devices = list((await session.execute(device_stmt)).scalars().all())
+    device_by_id = {device.id: device for device in devices}
+    for device in devices:
+        if device.stale:
+            issues.append(QualityIssue(id=f"device-stale-{device.id}", severity="warning", category="stale", title="设备已过期", message=f"{device.display_name} 最近未在同步结果中出现", deviceId=device.id, topologyId=topology_id))
+        if not device.enabled:
+            issues.append(QualityIssue(id=f"device-disabled-{device.id}", severity="info", category="disabled", title="设备已禁用", message=f"{device.display_name} 已禁用但仍保留在台账中", deviceId=device.id, topologyId=topology_id))
+
+    port_stmt = select(Port)
+    if scoped_device_ids is not None:
+        port_stmt = port_stmt.where(Port.device_id.in_(scoped_device_ids))
+    ports = list((await session.execute(port_stmt)).scalars().all())
+    port_by_id = {port.id: port for port in ports}
+    for port in ports:
+        if port.stale:
+            issues.append(QualityIssue(id=f"port-stale-{port.id}", severity="warning", category="stale", title="端口已过期", message=f"{device_by_id.get(port.device_id).display_name if device_by_id.get(port.device_id) else port.device_id} / {port.name} 最近未出现", deviceId=port.device_id, portId=port.id, topologyId=topology_id))
+
+    issues.extend(await duplicate_device_value_issues(session, Device.mgmt_ip, "mgmtIp", "重复管理 IP", topology_id, scoped_device_ids))
+    issues.extend(await duplicate_port_value_issues(session, Port.mac_address, "mac", "重复 MAC", topology_id, scoped_device_ids))
+
+    links = list((await session.execute(select(CableLink))).scalars().all())
+    port_ids_in_scope = set(port_by_id)
+    endpoint_usage: dict[int, list[CableLink]] = {}
+    for link in links:
+        link_in_scope = topology_id is None or (link.endpoint_a_port_id in port_ids_in_scope or link.endpoint_b_port_id in port_ids_in_scope)
+        if not link_in_scope:
+            continue
+        if topology_id is None or link.endpoint_a_port_id in port_ids_in_scope:
+            endpoint_usage.setdefault(link.endpoint_a_port_id, []).append(link)
+        if topology_id is None or link.endpoint_b_port_id in port_ids_in_scope:
+            endpoint_usage.setdefault(link.endpoint_b_port_id, []).append(link)
+        a = port_by_id.get(link.endpoint_a_port_id) or await session.get(Port, link.endpoint_a_port_id)
+        b = port_by_id.get(link.endpoint_b_port_id) or await session.get(Port, link.endpoint_b_port_id)
+        for endpoint in [a, b]:
+            if endpoint and endpoint.oper_status in {"down", "shutdown", "lower-layer-down"}:
+                issues.append(QualityIssue(id=f"linked-down-{link.id}-{endpoint.id}", severity="warning", category="link", title="已连接端口不可用", message=f"{endpoint.name} 已连接但状态为 {endpoint.oper_status}", deviceId=endpoint.device_id, portId=endpoint.id, linkId=link.id, topologyId=topology_id))
+        if topology_id is not None and a and b:
+            a_in = a.device_id in scoped_device_ids if scoped_device_ids is not None else True
+            b_in = b.device_id in scoped_device_ids if scoped_device_ids is not None else True
+            if a_in != b_in:
+                issues.append(QualityIssue(id=f"cross-topology-{link.id}", severity="info", category="topology", title="线缆跨拓扑", message="线缆另一端设备不在当前拓扑中", linkId=link.id, topologyId=topology_id))
+
+    for port_id, used_links in endpoint_usage.items():
+        if len(used_links) > 1:
+            port = port_by_id.get(port_id) or await session.get(Port, port_id)
+            issues.append(QualityIssue(id=f"multi-cable-{port_id}", severity="critical", category="link", title="端口连接多根线缆", message=f"{port.name if port else port_id} 同时连接了 {len(used_links)} 根线缆", deviceId=port.device_id if port else None, portId=port_id, topologyId=topology_id))
+
+    linked_port_ids = set(endpoint_usage)
+    for port in ports:
+        device = device_by_id.get(port.device_id)
+        if device and device.role == "server" and port.oper_status == "up" and not port.virtual and port.id not in linked_port_ids:
+            issues.append(QualityIssue(id=f"server-up-unlinked-{port.id}", severity="info", category="inventory", title="服务器 up 端口未接线", message=f"{device.display_name} / {port.name} 为 up 但没有线缆记录", deviceId=device.id, portId=port.id, topologyId=topology_id))
+
+    severity_order = {"critical": 0, "warning": 1, "info": 2}
+    return sorted(issues, key=lambda issue: (severity_order[issue.severity], issue.category, issue.id))
+
+
+async def duplicate_device_value_issues(session: AsyncSession, column, category: str, title: str, topology_id: int | None, scoped_device_ids: set[int] | None) -> list[QualityIssue]:
+    stmt = select(column, func.count(Device.id)).where(column.is_not(None), column != "").group_by(column).having(func.count(Device.id) > 1)
+    if scoped_device_ids is not None:
+        stmt = stmt.where(Device.id.in_(scoped_device_ids))
+    rows = (await session.execute(stmt)).all()
+    return [
+        QualityIssue(id=f"duplicate-device-{category}-{value}", severity="warning", category=category, title=title, message=f"{value} 被 {count} 台设备使用", topologyId=topology_id)
+        for value, count in rows
+    ]
+
+
+async def duplicate_port_value_issues(session: AsyncSession, column, category: str, title: str, topology_id: int | None, scoped_device_ids: set[int] | None) -> list[QualityIssue]:
+    stmt = select(column, func.count(Port.id)).where(column.is_not(None), column != "").group_by(column).having(func.count(Port.id) > 1)
+    if scoped_device_ids is not None:
+        stmt = stmt.where(Port.device_id.in_(scoped_device_ids))
+    rows = (await session.execute(stmt)).all()
+    return [
+        QualityIssue(id=f"duplicate-port-{category}-{value}", severity="warning", category=category, title=title, message=f"{value} 被 {count} 个端口使用", topologyId=topology_id)
+        for value, count in rows
+    ]
+
+
 def _normalize_ingest_port_identity(name: str) -> str:
     return normalize_port_name(name)
+
+
+def _normalize_ingest_source(source: str | None) -> str:
+    return (normalize_port_name(source or "")[:60] or "agent")
+
+
+def _source_port_identity(source: str, identity: str) -> str:
+    return f"{source}:{identity}"
 
 
 def _normalize_patterns(patterns: list[str]) -> list[str]:
@@ -1410,7 +1892,8 @@ async def _find_or_create_device_for_ingest(session: AsyncSession, source: str, 
         await session.flush()
         return device
 
-    device.source = source
+    if device.source == source or device.source not in PROTECTED_DEVICE_SOURCES:
+        device.source = source
     set_unless_overridden(device, "role", role)
     set_unless_overridden(device, "display_name", display_name)
     set_optional_unless_overridden(device, "model", clean_optional_str(payload.model))
@@ -1446,35 +1929,34 @@ async def _upsert_ingest_port(
     identity = _normalize_ingest_port_identity(name)
     if not identity:
         return None, False
-    port_identity = f"manual:{identity}"
-    existing_port: Port | None = None
-    if payload.ifIndex is not None:
-        result = await session.execute(select(Port).where(Port.device_id == device_id, Port.if_index == payload.ifIndex))
-        existing_port = result.scalar_one_or_none()
-    if existing_port is None:
-        result = await session.execute(
-            select(Port).where(Port.device_id == device_id, Port.identity == port_identity),
-        )
-        existing_port = result.scalar_one_or_none()
-    if existing_port is None:
-        existing_port = await session.execute(
-            select(Port).where(Port.device_id == device_id, Port.name == name)
-        )
-        existing_port = existing_port.scalar_one_or_none()
+    source_key = _normalize_ingest_source(source)
+    port_identity = _source_port_identity(source_key, identity)
+    legacy_manual_identity = _source_port_identity("manual", identity)
+    existing_port = await _find_existing_ingest_port(
+        session,
+        device_id=device_id,
+        source=source_key,
+        identity=port_identity,
+        legacy_manual_identity=legacy_manual_identity,
+        name=name,
+        if_index=payload.ifIndex,
+    )
 
     if existing_port is None:
         existing_port = Port(
             device_id=device_id,
-            source=source,
+            source=source_key,
             identity=port_identity,
             name=name,
         )
         session.add(existing_port)
 
-    existing_port.source = source
-    existing_port.identity = port_identity
+    if existing_port.source == source_key or existing_port.source not in PROTECTED_PORT_SOURCES:
+        existing_port.source = source_key
+        existing_port.identity = port_identity
     existing_port.if_index = payload.ifIndex if payload.ifIndex is not None else existing_port.if_index
     set_unless_overridden(existing_port, "name", name)
+    existing_port.virtual = is_virtual_port_name(existing_port.name)
     set_optional_unless_overridden(existing_port, "alias", clean_optional_str(payload.alias))
     existing_port.oper_status = clean_optional_str(payload.operStatus) or existing_port.oper_status or "unknown"
     existing_port.admin_status = clean_optional_str(payload.adminStatus) or existing_port.admin_status or "unknown"
@@ -1491,6 +1973,64 @@ async def _upsert_ingest_port(
     existing_port.tx_errors = payload.txErrors if payload.txErrors is not None else existing_port.tx_errors
     existing_port.stale = False
     return _normalize_ingest_port_identity(name), True
+
+
+async def _find_existing_ingest_port(
+    session: AsyncSession,
+    *,
+    device_id: int,
+    source: str,
+    identity: str,
+    legacy_manual_identity: str,
+    name: str,
+    if_index: int | None,
+) -> Port | None:
+    result = await session.execute(select(Port).where(Port.device_id == device_id, Port.identity == identity))
+    port = result.scalar_one_or_none()
+    if port is not None:
+        return port
+
+    result = await session.execute(
+        select(Port).where(
+            Port.device_id == device_id,
+            Port.identity == legacy_manual_identity,
+            Port.source == source,
+        )
+    )
+    port = result.scalar_one_or_none()
+    if port is not None:
+        return port
+
+    if if_index is not None:
+        result = await session.execute(select(Port).where(Port.device_id == device_id, Port.if_index == if_index))
+        candidates = list(result.scalars().all())
+        port = _best_ingest_port_candidate(candidates, source, identity, legacy_manual_identity)
+        if port is not None:
+            return port
+
+    result = await session.execute(select(Port).where(Port.device_id == device_id, Port.name == name))
+    candidates = list(result.scalars().all())
+    return _best_ingest_port_candidate(candidates, source, identity, legacy_manual_identity)
+
+
+def _best_ingest_port_candidate(
+    candidates: list[Port],
+    source: str,
+    identity: str,
+    legacy_manual_identity: str,
+) -> Port | None:
+    if not candidates:
+        return None
+    for port in candidates:
+        if port.identity == identity:
+            return port
+    for port in candidates:
+        if port.source == source and port.identity == legacy_manual_identity:
+            return port
+    for port in candidates:
+        if port.source in PROTECTED_PORT_SOURCES:
+            return port
+    return candidates[0]
 
 
 async def _resolve_ingest_endpoint(
@@ -1569,6 +2109,10 @@ async def _get_or_create_link(session: AsyncSession, endpoint_a: Port, endpoint_
     )
     link = result.scalar_one_or_none()
     if link is None:
+        conflicts = await cable_conflicts_for_ports(session, [endpoint_a_id, endpoint_b_id])
+        for conflict in conflicts:
+            if {conflict.endpoint_a_port_id, conflict.endpoint_b_port_id} != {endpoint_a_id, endpoint_b_id}:
+                await session.delete(conflict)
         link = CableLink(endpoint_a_port_id=endpoint_a_id, endpoint_b_port_id=endpoint_b_id)
         session.add(link)
     return link
@@ -1619,6 +2163,20 @@ async def get_link_or_404(session: AsyncSession, link_id: int) -> CableLink:
     return link
 
 
+async def cable_conflicts_for_ports(session: AsyncSession, port_ids: list[int]) -> list[CableLink]:
+    if not port_ids:
+        return []
+    result = await session.execute(
+        select(CableLink).where(
+            or_(
+                CableLink.endpoint_a_port_id.in_(port_ids),
+                CableLink.endpoint_b_port_id.in_(port_ids),
+            )
+        )
+    )
+    return list(result.scalars().all())
+
+
 def port_from_create(device_id: int, payload: PortCreate, *, name: str | None = None) -> Port:
     clean_name = clean_required_text(name or payload.name, "Port name is required")
     identity = manual_port_identity(clean_name)
@@ -1628,6 +2186,7 @@ def port_from_create(device_id: int, payload: PortCreate, *, name: str | None = 
         identity=identity,
         if_index=payload.ifIndex,
         name=clean_name,
+        virtual=is_virtual_port_name(clean_name),
         alias=payload.alias,
         oper_status="unknown",
         admin_status="unknown",

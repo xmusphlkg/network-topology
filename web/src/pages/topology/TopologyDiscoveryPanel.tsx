@@ -104,12 +104,15 @@ export function TopologyDiscoveryPanel({
             />
             <span className="discovery-main">
               <strong>{item.displayName}</strong>
-              <small title={item.model || undefined}>{item.model || item.mgmtIp || '-'}</small>
+              <small title={item.model || undefined}>
+                {item.model || item.mgmtIp || '-'}
+                {item.changes?.length ? ` · 变更 ${item.changes.map((change) => change.field).join(', ')}` : ''}
+              </small>
             </span>
             <span className="discovery-meta">
               <span>{item.role}</span>
               <span>{item.portCount} 端口</span>
-              {item.synced ? <StatusPill value="ok" /> : <span>未导入</span>}
+              {item.action === 'update' ? <StatusPill value="warning" /> : item.synced ? <StatusPill value="ok" /> : <span>新增</span>}
             </span>
           </label>
         ))}

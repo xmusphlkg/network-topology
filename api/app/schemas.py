@@ -17,6 +17,7 @@ class PortRead(BaseModel):
     identity: str
     ifIndex: int | None = Field(default=None, validation_alias="if_index")
     name: str
+    virtual: bool = False
     alias: str | None = None
     operStatus: str = Field(validation_alias="oper_status")
     adminStatus: str = Field(validation_alias="admin_status")
@@ -134,6 +135,7 @@ class CableLinkRead(BaseModel):
 class CableLinkCreate(BaseModel):
     endpointAPortId: int
     endpointBPortId: int
+    replaceExisting: bool = False
     label: str | None = None
     cableNo: str | None = None
     vlanId: int | None = Field(default=None, ge=1, le=4094)
@@ -326,16 +328,6 @@ class IpAddrIngestRequest(BaseModel):
     physicalPortNamePatterns: list[str] = Field(default_factory=lambda: ["eth", "eno", "ens", "enp", "enx", "em", "ib", "bond", "wan", "lan", "idrac", "ipmi", "bmc", "ilo"])
 
 
-class ZabbixDiscoveredDevice(BaseModel):
-    zabbixHostid: str
-    displayName: str
-    role: str
-    model: str | None = None
-    mgmtIp: str | None = None
-    portCount: int
-    synced: bool
-
-
 class LayoutNodeUpdate(BaseModel):
     nodeId: str
     x: float
@@ -365,6 +357,13 @@ class PortSeries(BaseModel):
     error: str | None = None
 
 
+class PortPage(BaseModel):
+    items: list[PortRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class SyncRunRead(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -378,8 +377,94 @@ class SyncRunRead(BaseModel):
     portsUpserted: int = Field(validation_alias="ports_upserted")
     staleDevices: int = Field(validation_alias="stale_devices")
     errorMessage: str | None = Field(default=None, validation_alias="error_message")
+    details: dict | None = Field(default=None, validation_alias="details_json")
+
+    @field_validator("details", mode="before")
+    @classmethod
+    def parse_details(cls, value):
+        if value is None or isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            import json
+
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
 
 
 class SyncStatus(BaseModel):
     latest: SyncRunRead | None = None
     zabbixConfigured: bool
+    readOnly: bool = False
+
+
+class ZabbixDeviceChange(BaseModel):
+    field: str
+    current: str | int | float | bool | None = None
+    incoming: str | int | float | bool | None = None
+
+
+class ZabbixDiscoveredDevice(BaseModel):
+    zabbixHostid: str
+    displayName: str
+    role: str
+    model: str | None = None
+    mgmtIp: str | None = None
+    portCount: int
+    synced: bool
+    action: Literal["new", "update", "synced"] = "new"
+    existingDeviceId: int | None = None
+    changes: list[ZabbixDeviceChange] = Field(default_factory=list)
+
+
+class ImportDryRunRead(BaseModel):
+    valid: bool
+    devices: int
+    ports: int
+    cableLinks: int
+    layouts: int
+    existingDevices: int = 0
+    newDevices: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class QualityIssue(BaseModel):
+    id: str
+    severity: Literal["critical", "warning", "info"]
+    category: str
+    title: str
+    message: str
+    deviceId: int | None = None
+    portId: int | None = None
+    linkId: int | None = None
+    topologyId: int | None = None
+
+
+class AuditLogRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    actor: str | None = None
+    action: str
+    resourceType: str = Field(validation_alias="resource_type")
+    resourceId: str | None = Field(default=None, validation_alias="resource_id")
+    details: dict | None = Field(default=None, validation_alias="details_json")
+    createdAt: datetime = Field(validation_alias="created_at")
+
+    @field_validator("details", mode="before")
+    @classmethod
+    def parse_details(cls, value):
+        if value is None or isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            import json
+
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None

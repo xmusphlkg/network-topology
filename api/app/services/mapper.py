@@ -100,7 +100,7 @@ def classify_host(host: dict[str, Any], settings: Settings) -> str:
 
 def host_text(host: dict[str, Any]) -> str:
     parts = [str(host.get("host") or ""), str(host.get("name") or "")]
-    groups = host.get("groups") or []
+    groups = host.get("groups") or host.get("hostgroups") or []
     parts.extend(str(group.get("name") or "") for group in groups)
     tags = host.get("tags") or []
     parts.extend(f"{tag.get('tag', '')}:{tag.get('value', '')}" for tag in tags)
@@ -217,11 +217,11 @@ def apply_item_to_port(port: PortSnapshot, item: dict[str, Any]) -> None:
         if raw and not raw.isdigit():
             port.alias = compact(raw, 240)
         return
-    if "ifoperstatus" in text or "operational status" in text or "oper status" in text or "运行状态" in text:
+    if any(token in text for token in ["ifoperstatus", "operstatus", "operational status", "oper status", "运行状态"]):
         port.oper_status = normalize_status(raw)
         port.oper_itemid = itemid
         return
-    if "ifadminstatus" in text or "admin status" in text or "administrative status" in text or "管理状态" in text:
+    if any(token in text for token in ["ifadminstatus", "adminstatus", "admin status", "administrative status", "管理状态"]):
         port.admin_status = normalize_status(raw)
         return
     if "ifspeed" in text or "ifhighspeed" in text or "speed" in text or "协商速率" in text:
@@ -258,11 +258,14 @@ def apply_item_to_port(port: PortSnapshot, item: dict[str, Any]) -> None:
 def looks_like_interface_item(text: str, value: str) -> bool:
     markers = [
         "net.if.",
+        "net.if",
         "ifname",
         "ifdescr",
         "ifalias",
         "ifoperstatus",
+        "operstatus",
         "ifadminstatus",
+        "adminstatus",
         "ifspeed",
         "ifhighspeed",
         "ifphysaddress",
@@ -352,7 +355,7 @@ def clean_port_name(value: str | None) -> str | None:
     patterns = [
         r"\b(?:XGE|QXGE|GE|GI|GIGABITETHERNET|TENGIGABITETHERNET|TEN-GIGABITETHERNET|TWENTYFIVEGIGE|FORTYGIGE|HUNDREDGIGE|ETHERNET|ETH|ET|PORT-CHANNEL|PORTCHANNEL|ETH-TRUNK)\s*\d+(?:/\d+)*\b",
         r"\b(?:XE|GE|ET)-\d+/\d+/\d+(?::\d+)?\b",
-        r"\b(?:ENP\d+S\d+F?\d*|ENS\d+F?\d*|ENO\d+|ETH\d+|BOND\d+|BR\d+)\b",
+        r"\b(?:ENP\d+S\d+F?\d*|ENS\d+F?\d*|ENO\d+|ENX[0-9A-F]+|EM\d+|ETH\d+|BOND\d+|BR\d+|IB\d+)\b",
         r"\b(?:MGMT|MANAGEMENT)\s*\d+(?:/\d+)*\b",
     ]
     for pattern in patterns:

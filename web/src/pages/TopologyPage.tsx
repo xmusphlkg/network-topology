@@ -200,16 +200,28 @@ export function TopologyPage() {
       queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
       feedback.pushToast('线缆已添加', 'success');
     },
-    onError: (error: Error) => {
+    onError: (error: Error, variables) => {
+      if (!variables.replaceExisting && error.message.includes('already connected')) {
+        void feedback
+          .confirm({
+            title: '替换已有线缆',
+            message: '所选端口已有线缆记录，是否替换旧连接？',
+            confirmText: '确认替换',
+            danger: true,
+          })
+          .then((confirmed) => {
+            if (confirmed) {
+              createCable.mutate({ ...variables, replaceExisting: true });
+            }
+          });
+        return;
+      }
       feedback.pushToast(error.message, 'error');
     },
   });
 
   const runSync = useMutation({
-    mutationFn: () => {
-      if (!topologyId) return api.runSync();
-      return api.runSync(topologyId);
-    },
+    mutationFn: () => api.runSync(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.topologySyncStatus() });
       queryClient.invalidateQueries({ queryKey: queryKeys.zabbixDiscovered(topologyId) });
@@ -326,8 +338,11 @@ export function TopologyPage() {
     },
   });
 
-  const deleteDevice = useMutation({
-    mutationFn: api.deleteDevice,
+  const removeDeviceFromTopology = useMutation({
+    mutationFn: (deviceId: number) => {
+      if (!topologyId) throw new Error('当前拓扑无效');
+      return api.removeDeviceFromTopology(topologyId, deviceId);
+    },
     onSuccess: () => {
       setHighlightedDeviceId(null);
       setSelectedPort(null);
@@ -336,7 +351,7 @@ export function TopologyPage() {
       queryClient.invalidateQueries({ queryKey: queryKeys.topology(topologyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.topologies() });
       queryClient.invalidateQueries({ queryKey: queryKeys.portsAll() });
-      feedback.pushToast('设备已删除', 'success');
+      feedback.pushToast('设备已移出当前拓扑', 'success');
     },
     onError: (error: Error) => {
       feedback.pushToast(error.message, 'error');
@@ -812,17 +827,17 @@ export function TopologyPage() {
     setDevicePortLayouts((current) => ({ ...current, [deviceId]: layoutKey }));
   }
 
-  function confirmDeleteDevice(device: Device) {
+  function confirmRemoveDeviceFromTopology(device: Device) {
     void feedback
       .confirm({
-        title: '删除设备',
-        message: `删除设备「${device.displayName}」及其端口和线缆？`,
-        confirmText: '确认删除',
+        title: '移出拓扑',
+        message: `将设备「${device.displayName}」从当前拓扑移出？设备台账和端口不会被删除。`,
+        confirmText: '确认移出',
         danger: true,
       })
       .then((confirmed) => {
         if (confirmed) {
-          deleteDevice.mutate(device.id);
+          removeDeviceFromTopology.mutate(device.id);
         }
       });
   }
@@ -899,6 +914,32 @@ export function TopologyPage() {
     saveLayout.mutate(payload);
   }
 
+  function autoLayoutCurrentTopology() {
+    const switchNodes: Node[] = [];
+    const endpointNodes: Node[] = [];
+    for (const node of nodes) {
+      const device = (node.data as { device?: Device }).device;
+      if (device?.role === 'switch') {
+        switchNodes.push(node);
+      } else {
+        endpointNodes.push(node);
+      }
+    }
+    const nextPositions: Record<string, { x: number; y: number }> = {};
+    switchNodes.forEach((node, index) => {
+      nextPositions[node.id] = { x: 80, y: 80 + index * 260 };
+    });
+    endpointNodes.forEach((node, index) => {
+      nextPositions[node.id] = { x: 720 + (index % 3) * 300, y: 80 + Math.floor(index / 3) * 150 };
+    });
+    setNodes((current) => current.map((node) => ({ ...node, position: nextPositions[node.id] || node.position })));
+    setMovedNodes((current) => ({ ...current, ...nextPositions }));
+    setHasLayoutDirty(true);
+    if (flowInstance) {
+      window.setTimeout(() => flowInstance.fitView({ padding: 0.18, maxZoom: 1 }), 0);
+    }
+  }
+
   const hasUnsavedLayout = hasLayoutDirty;
 
   useEffect(() => {
@@ -926,7 +967,16 @@ export function TopologyPage() {
     try {
       const text = await file.text();
       const payload = JSON.parse(text) as Record<string, unknown>;
-      importTopologyJson.mutate(payload);
+      const preview = await api.dryRunImportTopologyJson(topologyId, payload);
+      const warningText = preview.warnings.length ? `\n\n警告：${preview.warnings.join('；')}` : '';
+      const confirmed = await feedback.confirm({
+        title: '导入拓扑 JSON',
+        message: `将导入 ${preview.devices} 台设备、${preview.ports} 个端口、${preview.cableLinks} 条线缆、${preview.layouts} 个布局节点。预计新增 ${preview.newDevices} 台设备，更新/复用 ${preview.existingDevices} 台设备。${warningText}`,
+        confirmText: '确认导入',
+      });
+      if (confirmed) {
+        importTopologyJson.mutate(payload);
+      }
     } catch (error) {
       feedback.pushToast(
         error instanceof Error ? error.message : 'JSON 文件无法解析',
@@ -953,6 +1003,7 @@ export function TopologyPage() {
         connectModeText={connectMode ? connectModeStatusText(pendingLink) : null}
         hasUnsavedLayout={hasUnsavedLayout}
         onSaveLayout={saveCurrentLayout}
+        onAutoLayout={autoLayoutCurrentTopology}
         saveLayoutPending={saveLayout.isPending}
         canSaveLayout={nodes.length > 0}
         onExportJson={exportJson}
@@ -1131,10 +1182,10 @@ export function TopologyPage() {
                   <button
                     type="button"
                     className="danger-icon"
-                    title="删除设备"
-                    aria-label={`删除设备 ${device.displayName}`}
-                    onClick={() => confirmDeleteDevice(device)}
-                    disabled={deleteDevice.isPending}
+                    title="移出当前拓扑"
+                    aria-label={`移出当前拓扑 ${device.displayName}`}
+                    onClick={() => confirmRemoveDeviceFromTopology(device)}
+                    disabled={removeDeviceFromTopology.isPending}
                   >
                     <Trash2 size={14} />
                   </button>

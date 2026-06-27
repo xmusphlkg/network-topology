@@ -79,6 +79,7 @@ class Port(Base, TimestampMixin):
     identity: Mapped[str] = mapped_column(String(191))
     if_index: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(120), index=True)
+    virtual: Mapped[bool] = mapped_column("is_virtual", Boolean, default=False, index=True)
     alias: Mapped[str | None] = mapped_column(String(240), nullable=True)
     oper_status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
     admin_status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
@@ -160,3 +161,16 @@ class ZabbixSyncRun(Base, TimestampMixin):
     ports_upserted: Mapped[int] = mapped_column(Integer, default=0)
     stale_devices: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "st_audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    resource_type: Mapped[str] = mapped_column(String(60), index=True)
+    resource_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

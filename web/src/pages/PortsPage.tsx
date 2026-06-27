@@ -26,6 +26,9 @@ export function PortsPage() {
   const includeStale = includeStaleQuery === null ? true : includeStaleQuery !== 'false';
   const includeVirtualQuery = searchParams.get('includeVirtual');
   const includeVirtual = includeVirtualQuery === null ? false : includeVirtualQuery === 'true';
+  const pageSize = 80;
+  const offsetQuery = Number(searchParams.get('offset'));
+  const offset = Number.isFinite(offsetQuery) && offsetQuery >= 0 ? offsetQuery : 0;
 
   const [search, setSearch] = useState(searchQuery);
   const [statusFilter, setStatusFilter] = useState<PortStatusFilter>(statusQuery);
@@ -37,15 +40,23 @@ export function PortsPage() {
       status: statusFilter === 'all' ? undefined : statusFilter,
       includeStale,
       includeVirtual,
+      media: mediaFilter === 'all' ? undefined : mediaFilter,
+      speed: speedFilter === 'all' ? undefined : speedFilter,
       search: search.trim(),
+      limit: pageSize,
+      offset,
     }),
     queryFn: () =>
-      api.ports({
+      api.portsPage({
         topologyId,
         status: statusFilter === 'all' ? undefined : statusFilter,
         includeStale,
         includeVirtual,
+        media: mediaFilter === 'all' ? undefined : mediaFilter,
+        speed: speedFilter === 'all' ? undefined : speedFilter,
         search: search.trim(),
+        limit: pageSize,
+        offset,
       }),
   });
   const scopeDevices = useQuery({
@@ -77,13 +88,13 @@ export function PortsPage() {
 
   const mediaList = useMemo(() => {
     const items = new Set<string>();
-    for (const port of ports.data || []) {
+    for (const port of ports.data?.items || []) {
       if (port.media) {
         items.add(port.media);
       }
     }
     return ['all', ...Array.from(items).sort()];
-  }, [ports.data]);
+  }, [ports.data?.items]);
 
   useEffect(() => {
     setSearch(searchQuery);
@@ -113,6 +124,7 @@ export function PortsPage() {
     } else {
       next.delete('q');
     }
+    next.delete('offset');
     setSearchParams(next, { replace: true });
   }
 
@@ -124,6 +136,7 @@ export function PortsPage() {
     } else {
       next.set('status', value);
     }
+    next.delete('offset');
     setSearchParams(next, { replace: true });
   }
 
@@ -134,6 +147,7 @@ export function PortsPage() {
     } else {
       next.delete('topologyId');
     }
+    next.delete('offset');
     setSearchParams(next, { replace: true });
   }
 
@@ -144,6 +158,7 @@ export function PortsPage() {
     } else {
       nextSearch.set('includeStale', 'false');
     }
+    nextSearch.delete('offset');
     setSearchParams(nextSearch, { replace: true });
   }
 
@@ -154,6 +169,7 @@ export function PortsPage() {
     } else {
       nextSearch.delete('includeVirtual');
     }
+    nextSearch.delete('offset');
     setSearchParams(nextSearch, { replace: true });
   }
 
@@ -164,6 +180,7 @@ export function PortsPage() {
     } else {
       next.set('media', value);
     }
+    next.delete('offset');
     setSearchParams(next, { replace: true });
   }
 
@@ -174,50 +191,32 @@ export function PortsPage() {
     } else {
       next.set('speed', value);
     }
+    next.delete('offset');
     setSearchParams(next, { replace: true });
   }
 
-  const sourceRows = useMemo(() => ports.data || [], [ports.data]);
-
-  const rows = useMemo(() => {
-    const terms = search
-      .trim()
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(Boolean);
-
-    return sourceRows.filter((port) => {
-      if (statusFilter === 'stale') {
-        if (!port.stale) return false;
-      } else if (statusFilter !== 'all' && port.operStatus !== statusFilter) {
-        return false;
-      }
-
-      if (!includeStale && !port.stale && statusFilter !== 'stale') {
-        // keep only non-stale
-      }
-      if (!includeStale && port.stale && statusFilter !== 'stale') {
-        return false;
-      }
-
-      if (mediaFilter !== 'all' && port.media !== mediaFilter) return false;
-
-      if (speedFilter === '1g' && !isAtLeastSpeed(port.speedMbps, 1000)) return false;
-      if (speedFilter === '10g' && !isAtLeastSpeed(port.speedMbps, 10000)) return false;
-      if (speedFilter === 'slow' && isAtLeastSpeed(port.speedMbps, 1000)) return false;
-
-      const device = deviceById.get(port.deviceId);
-      if (!terms.length) return true;
-      const haystack = `${port.name} ${port.alias || ''} ${port.vlanSummary || ''} ${port.macAddress || ''} ${device?.displayName || ''} ${device?.mgmtIp || ''}`
-        .toLowerCase();
-      return terms.every((term) => haystack.includes(term));
-    });
-  }, [includeStale, mediaFilter, search, sourceRows, speedFilter, statusFilter, deviceById]);
+  const sourceRows = useMemo(() => ports.data?.items || [], [ports.data?.items]);
+  const rows = sourceRows;
+  const totalRows = ports.data?.total || 0;
+  const currentPage = Math.floor(offset / pageSize) + 1;
+  const totalPages = Math.max(Math.ceil(totalRows / pageSize), 1);
+  const canPrev = offset > 0;
+  const canNext = offset + pageSize < totalRows;
 
   const upCount = useMemo(() => sourceRows.filter((port) => port.operStatus === 'up').length, [sourceRows]);
   const downCount = useMemo(() => sourceRows.filter((port) => port.operStatus === 'down').length, [sourceRows]);
   const staleCount = useMemo(() => sourceRows.filter((port) => port.stale).length, [sourceRows]);
   const vlanCount = useMemo(() => sourceRows.filter((port) => Boolean(port.vlanSummary?.trim())).length, [sourceRows]);
+
+  function updateOffset(nextOffset: number) {
+    const next = new URLSearchParams(searchParams);
+    if (nextOffset > 0) {
+      next.set('offset', String(nextOffset));
+    } else {
+      next.delete('offset');
+    }
+    setSearchParams(next, { replace: true });
+  }
 
   return (
     <div className="page">
@@ -225,7 +224,7 @@ export function PortsPage() {
         <div>
           <h1>端口列表</h1>
           <p>
-            {rows.length} / {sourceRows.length} 个端口 · {scopeHint}
+            第 {currentPage}/{totalPages} 页 · {rows.length} / {totalRows} 个端口 · {scopeHint}
           </p>
         </div>
         <div className="toolbar">
@@ -234,7 +233,7 @@ export function PortsPage() {
       </div>
       <MetricStrip
         items={[
-          { label: '总端口', value: sourceRows.length },
+          { label: '总端口', value: totalRows },
           { label: 'up', value: upCount },
           { label: 'down', value: downCount },
           { label: 'stale', value: staleCount },
@@ -249,7 +248,7 @@ export function PortsPage() {
         </label>
         <div className="filter-chip-group">
           <button type="button" className={`filter-chip ${statusFilter === 'all' ? 'active' : ''}`} onClick={() => updateStatusFilter('all')}>
-            全部 <strong>{sourceRows.length}</strong>
+            全部 <strong>{totalRows}</strong>
           </button>
           <button type="button" className={`filter-chip ${statusFilter === 'up' ? 'active' : ''}`} onClick={() => updateStatusFilter('up')}>
             up <strong>{upCount}</strong>
@@ -344,6 +343,15 @@ export function PortsPage() {
           </table>
           {!rows.length ? <div className="muted-note tight">没有匹配的端口。</div> : null}
         </div>
+        <div className="table-pagination">
+          <button className="text-button" type="button" disabled={!canPrev || ports.isFetching} onClick={() => updateOffset(Math.max(offset - pageSize, 0))}>
+            上一页
+          </button>
+          <span>{offset + 1}-{Math.min(offset + pageSize, totalRows)} / {totalRows}</span>
+          <button className="text-button" type="button" disabled={!canNext || ports.isFetching} onClick={() => updateOffset(offset + pageSize)}>
+            下一页
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -362,9 +370,4 @@ function parseMediaFilter(value: string | null): MediaFilter {
 function parseSpeedFilter(value: string | null): SpeedFilter {
   if (value === 'slow' || value === '1g' || value === '10g') return value;
   return 'all';
-}
-
-function isAtLeastSpeed(speedMbps: number | null | undefined, threshold: number) {
-  if (!Number.isFinite(Number(speedMbps))) return false;
-  return Number(speedMbps) >= threshold;
 }

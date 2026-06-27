@@ -23,11 +23,15 @@ class Settings(BaseSettings):
     mysql_connect_timeout_sec: int = 10
     db_echo: bool = False
     auto_create_tables: bool = True
+    read_only_mode: bool = False
+    admin_token: str | None = None
 
     zabbix_url: str = "http://127.0.0.1:8080"
     zabbix_token: str | None = None
     zabbix_user: str | None = None
     zabbix_password: str | None = None
+    zabbix_auth_mode: Literal["bearer", "auth", "auto"] = "bearer"
+    zabbix_logout_on_shutdown: bool = True
     zabbix_timeout_sec: float = 10.0
     zabbix_concurrency: int = 4
 
@@ -49,6 +53,11 @@ class Settings(BaseSettings):
         if not stripped or stripped.endswith("/api_jsonrpc.php"):
             return stripped
         return f"{stripped}/api_jsonrpc.php"
+
+    @field_validator("zabbix_auth_mode", mode="before")
+    @classmethod
+    def normalize_zabbix_auth_mode(cls, value: str | None) -> str:
+        return str(value or "bearer").strip().lower()
 
     def sqlalchemy_url(self) -> str:
         if self.database_url:

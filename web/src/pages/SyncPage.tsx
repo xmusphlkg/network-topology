@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CircleSlash2, Copy, RefreshCw, Send, Terminal } from 'lucide-react';
+import { AlertTriangle, CircleSlash2, Copy, History, RefreshCw, Send, Terminal } from 'lucide-react';
 import { api } from '../lib/api';
 import { buildSyncPayload, syncPushTemplates } from '../lib/syncTemplates';
 import { queryKeys } from '../lib/queryKeys';
@@ -35,6 +35,8 @@ export function SyncPage() {
   const topologies = useQuery({ queryKey: queryKeys.topologies(), queryFn: api.topologies, staleTime: 60000 });
   const status = useQuery({ queryKey: queryKeys.topologySyncStatus(), queryFn: api.syncStatus, refetchInterval: 10000 });
   const runs = useQuery({ queryKey: queryKeys.syncRuns(8), queryFn: () => api.syncRuns(8), refetchInterval: 15000 });
+  const quality = useQuery({ queryKey: ['quality-issues'], queryFn: () => api.qualityIssues(), refetchInterval: 30000 });
+  const audit = useQuery({ queryKey: ['audit-logs'], queryFn: () => api.auditLogs(12), refetchInterval: 30000 });
 
   const run = useMutation({
     mutationFn: () => api.runSync(),
@@ -210,7 +212,8 @@ export function SyncPage() {
   const history = runs.data || [];
   const statusText = latest ? (latest.status === 'success' ? '正常' : latest.status === 'failed' ? '失败' : '运行中') : '待同步';
   const statusTone = latest ? (latest.status === 'success' ? 'ok' : latest.status === 'failed' ? 'critical' : 'unknown') : 'unknown';
-  const configuredText = status.data?.zabbixConfigured ? '已配置' : '未配置';
+  const configuredText = status.data?.readOnly ? '只读模式' : status.data?.zabbixConfigured ? '已配置' : '未配置';
+  const detailHostids = Array.isArray(latest?.details?.hostids) ? latest?.details?.hostids.length : null;
 
   return (
     <div className="page">
@@ -294,8 +297,62 @@ export function SyncPage() {
               <span>过期设备</span>
               <strong>{latest ? number(latest.staleDevices, 0) : '-'}</strong>
             </div>
+            <div className="sync-detail-row">
+              <span>Host 明细</span>
+              <strong>{detailHostids == null ? '-' : `${detailHostids} 个 hostid`}</strong>
+            </div>
           </div>
           {latest?.errorMessage ? <div className="error-panel">最近同步错误：{latest.errorMessage}</div> : <div className="muted-note tight">最近同步结果会显示在这里。</div>}
+        </section>
+
+        <section className="panel sync-history-panel">
+          <div className="section-head">
+            <h2>数据质量</h2>
+            <span className="rail-workspace-badge">{quality.data?.length || 0} 项</span>
+          </div>
+          {(quality.data || []).length ? (
+            <div className="quality-list">
+              {(quality.data || []).slice(0, 12).map((issue) => (
+                <div className={`quality-row ${issue.severity}`} key={issue.id}>
+                  <AlertTriangle size={15} />
+                  <span>
+                    <strong>{issue.title}</strong>
+                    <small>{issue.message}</small>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="muted-note tight">暂未发现数据质量问题。</div>
+          )}
+        </section>
+
+        <section className="panel sync-history-panel">
+          <div className="section-head">
+            <h2>操作审计</h2>
+            <span className="rail-workspace-badge">{audit.data?.length || 0} 条</span>
+          </div>
+          {(audit.data || []).length ? (
+            <div className="sync-history-list">
+              {(audit.data || []).map((item) => (
+                <div className="sync-history-row" key={item.id}>
+                  <div className="sync-history-main">
+                    <strong>{item.action}</strong>
+                    <span>{item.resourceType} {item.resourceId || '-'}</span>
+                  </div>
+                  <div className="sync-history-metrics">
+                    <span>{item.actor || 'system'}</span>
+                    <span>{dateTime(item.createdAt)}</span>
+                  </div>
+                  <div className="sync-history-state">
+                    <History size={15} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="muted-note tight">还没有操作审计记录。</div>
+          )}
         </section>
 
         <section className="panel sync-history-panel">

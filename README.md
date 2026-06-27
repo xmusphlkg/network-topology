@@ -35,6 +35,16 @@ mysql -uroot -p -e "GRANT ALL PRIVILEGES ON switch_topology.* TO 'switch_topolog
 cp .env.local.example .env
 ```
 
+Zabbix 7.x 推荐使用前端里创建的 API token：
+
+```env
+ZABBIX_URL=http://127.0.0.1:8080/zabbix
+ZABBIX_TOKEN=你的 API token
+ZABBIX_AUTH_MODE=bearer
+```
+
+`ZABBIX_URL` 可以填站点根路径或完整 `api_jsonrpc.php`，程序会自动补齐 JSON-RPC 端点。没有 API token 时也可以填 `ZABBIX_USER`/`ZABBIX_PASSWORD`，程序会用当前 Zabbix API 的 `username/password` 登录参数，并在关闭时注销会话。若需要兼容旧 Zabbix 或中间代理无法转发 `Authorization` header，可把 `ZABBIX_AUTH_MODE` 设为 `auto` 或 `auth`。
+
 ### 2) 启动后端（本地 Python）
 
 ```bash

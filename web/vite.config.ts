@@ -12,10 +12,18 @@ export default defineConfig({
     chunkSizeWarningLimit: 700,
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom', 'react-router-dom', '@tanstack/react-query'],
-          flow: ['@xyflow/react'],
-          charts: ['echarts'],
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (/[\\/]node_modules[\\/](react|react-dom|react-router-dom|@tanstack[\\/]react-query)[\\/]/.test(id)) {
+            return 'react';
+          }
+          if (/[\\/]node_modules[\\/]@xyflow[\\/]react[\\/]/.test(id)) {
+            return 'flow';
+          }
+          if (/[\\/]node_modules[\\/]echarts[\\/]/.test(id)) {
+            return 'charts';
+          }
+          return undefined;
         },
       },
     },
